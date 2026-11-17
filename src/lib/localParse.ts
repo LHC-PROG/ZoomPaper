@@ -38,12 +38,18 @@ function toTextItem(raw: unknown): PdfTextItem | null {
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
   const width = Number(item.width);
   const height = Number(item.height);
+  // 真实字号来自文本矩阵的水平缩放：pdf.js 的 height 有时是字体的整体高度（≈2 倍字号）。
+  const size = Math.hypot(Number(transform[0]), Number(transform[1])) || height || 10;
+  // 旋转文本（页边 arXiv 印章、竖排表头）不参与正文排序，否则会和正文同一基线串在一起。
+  const rotated = Math.abs(Number(transform[1])) > 0.01 || Math.abs(Number(transform[2])) > 0.01;
   return {
     str: item.str,
     x,
     y,
     width: Number.isFinite(width) && width > 0 ? width : item.str.length * 5,
     height: Number.isFinite(height) && height > 0 ? height : 10,
+    size: Number.isFinite(size) && size > 0 ? size : 10,
+    rotated,
   };
 }
 
