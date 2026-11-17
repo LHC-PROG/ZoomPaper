@@ -31,6 +31,22 @@ npm run tauri -- build --debug --no-bundle
 
 生产安装包需另行执行 `npm run tauri -- build`，并验证安装、卸载、升级、协议注册与签名。本次未验证 MSI/NSIS 安装器。
 
+## 控制台窗口
+
+Windows 下默认用 GUI 子系统启动，双击 `zoompaper.exe` 不会附带控制台窗口。需要看 stdout/stderr（排查启动、网络与模型加载）时，加上 `console` feature 构建：
+
+```powershell
+npm run tauri -- build --debug --no-bundle --features console
+```
+
+无控制台时 panic 信息会写到数据目录的 `last-crash.txt`，便于事后定位。
+
+## 正文提取
+
+默认使用本机提取：用包内的 pdf.js 读取 PDF 文字层，生成 `paper.md` 与 `content_list.json`，不需要 MinerU Key。需要公式、表格与图片结构时，在「设置 → 导入与解析 → 正文提取方式」切换到 MinerU 云端解析。
+
+扫描件没有文字层，本机提取会直接给出提示而不是写空正文；这类文档需要 OCR 或云端解析。
+
 ## ONNX 下载缓慢时
 
 `fastembed` 的 `ort-sys` 会下载 ONNX Runtime。下载等待不代表应用源码编译错误。可使用该依赖支持的 `ORT_LIB_LOCATION` 和 `ORT_PREFER_DYNAMIC_LINK=1` 指定匹配的官方 Windows 运行库。必须将匹配的 DLL 放到可执行文件旁边；仅修改 PATH 可能仍加载到 Windows 自带的旧版本。
