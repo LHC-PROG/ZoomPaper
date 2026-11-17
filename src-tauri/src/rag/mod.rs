@@ -17,6 +17,18 @@ use zerocopy::AsBytes;
 /// 合并后的单个 chunk 目标长度（字符）。
 const CHUNK_CHAR_LIMIT: usize = 800;
 
+/// 相邻 chunk 的重叠长度（字符）。
+///
+/// 句子正好被 800 字切断时，问题里的关键词可能落在下一块，
+/// 留下约 15% 的重叠能让检索仍然命中这段上下文。
+const CHUNK_OVERLAP_CHARS: usize = 120;
+
+/// 章节路径最多保留的层级（`3.2 Attention > 3.2.1 Scaled …`）。
+const SECTION_PATH_LEVELS: usize = 2;
+
+/// 章节路径的最大长度，避免引用标签过长。
+const SECTION_NAME_MAX: usize = 160;
+
 /// 每轮检索该论文相关段落的条数。
 pub const TOP_K: usize = 5;
 
@@ -51,20 +63,83 @@ pub struct ChunkDraft {
     pub bbox: Option<String>,
 }
 
-/// 按阅读顺序分块。标题（`text_level >= 1`）处断开并更新 section。
+/// 章节标题里的编号（`3.2.1 Scaled …` → `3.2.1`），没有编号返回 None。
+fn heading_number(text: &str) -> Option<String> {
+    let token = text.split_whitespace().next()?.trim_end_matches('.');
+    if token.is_empty() || !token.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    token
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.')
+        .then(|| token.to_string())
+}
+
+/// 维护标题栈：子章节编号是父章节编号的前缀时压栈，否则回退到公共父级。
+fn push_heading(path: &mut Vec<(String, String)>, text: &str) {
+    match heading_number(text) {
+        Some(number) => {
+            while let Some((last, _)) = path.last() {
+                let is_ancestor = !last.is_empty() && number.starts_with(&format!("{last}."));
+                if is_ancestor {
+                    break;
+                }
+                path.pop();
+            }
+            path.push((number, text.to_string()));
+        }
+        None => {
+            path.clear();
+            path.push((String::new(), text.to_string()));
+        }
+    }
+}
+
+/// 章节路径只保留最近两级：`3.2 Attention > 3.2.1 Scaled Dot-Product Attention`。
+fn section_path(path: &[(String, String)]) -> String {
+    let start = path.len().saturating_sub(SECTION_PATH_LEVELS);
+    let joined = path[start..]
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .collect::<Vec<_>>()
+        .join(" > ");
+    joined.chars().take(SECTION_NAME_MAX).collect()
+}
+
+/// 取一段文字的尾部作为下一块的重叠前缀，尽量从词边界开始。
+fn overlap_tail(text: &str, limit: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= limit {
+        return String::new();
+    }
+    let slice: String = chars[chars.len() - limit..].iter().collect();
+    match slice.find(char::is_whitespace) {
+        Some(position) if position + 1 < slice.len() => slice[position + 1..].trim_start().to_string(),
+        _ => slice,
+    }
+}
+
+/// 按阅读顺序分块。标题（`text_level >= 1`）处断开并更新章节路径。
 /// `text` 与 `equation` 块并入正文（MinerU 的 equation `text` 字段即 `$$...$$`
 /// 包裹的 LaTeX 纯文本，文本 embedding 模型可直接消化）；`image`/`table` 等跳过。
+///
+/// 两个影响检索质量的行为：章节带层级路径（引用可读），相邻块留少量重叠（避免切断上下文）。
 pub fn chunk_content_list(blocks: &[ContentBlock]) -> Vec<ChunkDraft> {
     let mut chunks = Vec::new();
-    let mut section = String::new();
+    let mut path: Vec<(String, String)> = Vec::new();
     let mut buf = String::new();
     let mut start_block: i64 = 0;
     let mut start_page: Option<i64> = None;
     let mut start_bbox: Option<String> = None;
+    // 上一块的尾部文字，等下一个正文块出现时才补进新块。
+    // 若论文正好在分块边界结束，就不会多出一个只有重叠尾巴的碎块。
+    let mut pending_overlap = String::new();
+    // buf 里目前是上一块的重叠尾巴时，下一个正文块需要重新决定起始定位。
+    let mut need_start = true;
 
     fn flush(
         chunks: &mut Vec<ChunkDraft>,
-        section: &str,
+        path: &[(String, String)],
         buf: &mut String,
         start_block: i64,
         end_block: i64,
@@ -73,7 +148,7 @@ pub fn chunk_content_list(blocks: &[ContentBlock]) -> Vec<ChunkDraft> {
     ) {
         if !buf.trim().is_empty() {
             chunks.push(ChunkDraft {
-                section: section.to_string(),
+                section: section_path(path),
                 content: buf.trim().to_string(),
                 start_block,
                 end_block,
@@ -88,24 +163,26 @@ pub fn chunk_content_list(blocks: &[ContentBlock]) -> Vec<ChunkDraft> {
         let idx = i as i64;
         let text = block.text.as_deref().unwrap_or("").trim();
 
-        // 标题：断开当前 chunk，更新 section
+        // 标题：断开当前 chunk，更新章节路径
         if block.text_level.unwrap_or(0) >= 1 && !text.is_empty() {
             flush(
                 &mut chunks,
-                &section,
+                &path,
                 &mut buf,
                 start_block,
                 idx.saturating_sub(1),
                 start_page,
                 start_bbox.clone(),
             );
-            section = text.to_string();
+            push_heading(&mut path, text);
+            pending_overlap.clear();
             start_block = idx;
             start_page = block.page_idx.map(i64::from);
             start_bbox = block
                 .bbox
                 .as_ref()
                 .map(|b| serde_json::to_string(b).unwrap_or_default());
+            need_start = true;
             continue;
         }
 
@@ -114,14 +191,22 @@ pub fn chunk_content_list(blocks: &[ContentBlock]) -> Vec<ChunkDraft> {
             continue;
         }
 
-        // 首个正文块记录起始定位
-        if buf.is_empty() {
+        // 重叠尾巴先落进新块，接着再写正文。
+        if !pending_overlap.is_empty() {
+            buf.push_str(&pending_overlap);
+            pending_overlap.clear();
+            need_start = true;
+        }
+
+        // 首个正文块记录起始定位（重叠尾巴不算正文起点）
+        if need_start {
             start_block = idx;
             start_page = block.page_idx.map(i64::from);
             start_bbox = block
                 .bbox
                 .as_ref()
                 .map(|b| serde_json::to_string(b).unwrap_or_default());
+            need_start = false;
         }
 
         if !buf.is_empty() {
@@ -129,11 +214,12 @@ pub fn chunk_content_list(blocks: &[ContentBlock]) -> Vec<ChunkDraft> {
         }
         buf.push_str(text);
 
-        // 超长则 flush
+        // 超长则 flush，并把尾部留给下一块
         if buf.chars().count() >= CHUNK_CHAR_LIMIT {
+            pending_overlap = overlap_tail(&buf, CHUNK_OVERLAP_CHARS);
             flush(
                 &mut chunks,
-                &section,
+                &path,
                 &mut buf,
                 start_block,
                 idx,
@@ -146,7 +232,7 @@ pub fn chunk_content_list(blocks: &[ContentBlock]) -> Vec<ChunkDraft> {
     // 收尾
     flush(
         &mut chunks,
-        &section,
+        &path,
         &mut buf,
         start_block,
         blocks.len() as i64 - 1,
@@ -567,6 +653,52 @@ mod tests {
         // 超长单块作为整体语义单元保持完整（bge 上限 512 tokens 足够容纳）
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].content, long.trim());
+    }
+
+    /// 章节路径要保留父子关系，引用里才能看出「这句话属于哪一节」。
+    #[test]
+    fn chunking_builds_nested_section_paths() {
+        let blocks = vec![
+            block("text", "3 Model Architecture", 1, 0),
+            block("text", "Body under the model chapter.", 0, 0),
+            block("text", "3.2 Attention", 1, 1),
+            block("text", "Body under attention.", 0, 1),
+            block("text", "3.2.1 Scaled Dot-Product Attention", 1, 1),
+            block("text", "Body under the scaled variant.", 0, 1),
+            block("text", "4 Training", 1, 2),
+            block("text", "Body under training.", 0, 2),
+        ];
+        let chunks = chunk_content_list(&blocks);
+        assert_eq!(chunks[0].section, "3 Model Architecture");
+        assert_eq!(chunks[1].section, "3 Model Architecture > 3.2 Attention");
+        assert_eq!(
+            chunks[2].section,
+            "3.2 Attention > 3.2.1 Scaled Dot-Product Attention"
+        );
+        assert_eq!(chunks[3].section, "4 Training");
+    }
+
+    /// 相邻块要有重叠，句子被切在 800 字边界时上下文才不会断。
+    #[test]
+    fn chunking_overlaps_neighbouring_chunks() {
+        let long: String = "word ".repeat(300);
+        let blocks = vec![
+            block("text", "1 Introduction", 1, 0),
+            block("text", &long, 0, 0),
+            block("text", "Tail paragraph after the split.", 0, 1),
+        ];
+        let chunks = chunk_content_list(&blocks);
+        assert_eq!(chunks.len(), 2);
+        let first = &chunks[0].content;
+        let tail: String = first.chars().skip(first.chars().count() - 60).collect();
+        assert!(
+            chunks[1].content.contains(tail.trim()),
+            "第二块应以第一块尾部开头：{}",
+            chunks[1].content
+        );
+        assert!(chunks[1].content.ends_with("Tail paragraph after the split."));
+        // 重叠尾巴不单独成为碎块
+        assert!(chunks.iter().all(|chunk| chunk.content.chars().count() > 60));
     }
 
     fn setup_db() -> Connection {
