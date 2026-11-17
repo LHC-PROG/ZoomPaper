@@ -8,16 +8,16 @@ import { IconTooltip } from "@/components/ui/icon-tooltip";
 
 const stages: Record<string, string> = {
   queued: "等待处理", uploading: "正在上传", pending: "云端排队", converting: "正在转换",
-  running: "正在解析", downloading: "正在获取正文", reconnecting: "正在重连",
+  running: "正在解析", downloading: "正在获取正文", reconnecting: "正在重连", extract: "正在提取正文",
 };
-const kinds: Record<string, string> = { parse: "解析", index: "建立索引", translate: "翻译标题与摘要", doi: "补全出版信息", blog: "生成博客", full_translation: "翻译全文" };
+const kinds: Record<string, string> = { parse: "解析", parse_local: "解析", index: "建立索引", translate: "翻译标题与摘要", doi: "补全出版信息", blog: "生成博客", full_translation: "翻译全文" };
 const active = (job: CompanionTask) => job.status === "queued" || job.status === "running" || job.status === "canceling";
 export function jobLabel(job: CompanionTask) {
   if (job.status === "canceling") return "正在停止";
   if (job.status === "failed") return `${kinds[job.kind]}失败`;
   if (job.status === "canceled") return "已取消";
   if (job.status === "done") return `${kinds[job.kind]}完成`;
-  return job.status === "queued" ? "等待处理" : job.kind === "parse" ? stages[job.stage] || "正在解析" : `正在${kinds[job.kind]}`;
+  return job.status === "queued" ? "等待处理" : job.kind === "parse" || job.kind === "parse_local" ? stages[job.stage] || "正在解析" : `正在${kinds[job.kind]}`;
 }
 /** Repo-native vector character: no remote assets, animation respects reduced motion. */
 type BirdState = "idle" | "reading" | "working" | "success" | "error" | "sleep";
@@ -109,7 +109,7 @@ export function ReadingCompanion({ jobs, notice, readingTitle, onDismiss, onOpen
   }, [finished, expanded]);
   const pending = jobs.filter(active);
   const failed = jobs.filter(job => job.status === "failed").sort((a,b) => b.updated_at-a.updated_at)[0];
-  const current = pending.find((job) => job.status === "running" && job.kind === "parse") || pending.find((job) => job.status === "running") || pending[0];
+  const current = pending.find((job) => job.status === "running" && (job.kind === "parse" || job.kind === "parse_local")) || pending.find((job) => job.status === "running") || pending[0];
   const busy = pending.length > 0 || notice?.phase === "downloading";
   const count = new Set(pending.map((job) => job.paper_id)).size;
   const title = notice?.phase === "downloading" ? `正在导入 ${notice.title}`

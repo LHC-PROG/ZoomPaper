@@ -284,6 +284,18 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_conversations_paper_updated ON conversations(paper_id, type, updated_at DESC);")?;
         conn.pragma_update(None, "user_version", 19)?;
     }
+    // v20：记录正文抽取来源（local / mineru），供界面提示与诊断使用。
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 20 {
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(papers)")?
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !columns.iter().any(|column| column == "parse_engine") {
+            conn.execute_batch("ALTER TABLE papers ADD COLUMN parse_engine TEXT;")?;
+        }
+        conn.pragma_update(None, "user_version", 20)?;
+    }
     Ok(())
 }
 
@@ -331,7 +343,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
 
         // 论文数据无损
@@ -496,7 +508,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
 
         let items: Vec<(String, Option<i64>)> = conn
@@ -539,7 +551,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 19);
+        assert_eq!(version, 20);
     }
 
     /// 迁移幂等：重复执行不报错。
@@ -551,7 +563,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 19);
+        assert_eq!(v, 20);
     }
 
     #[test]
@@ -582,7 +594,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            19
+            20
         );
     }
 

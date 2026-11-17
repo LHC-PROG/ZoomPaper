@@ -117,7 +117,7 @@ export function Library({ onOpenPaper, onOpenPapers, refreshSignal = 0, jobs = [
   const [importing, setImporting] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [parsingId, setParsingId] = useState<string | null>(null);
-  const parseJobs = jobs.filter((job) => job.kind === "parse" && ["queued", "running"].includes(job.status));
+  const parseJobs = jobs.filter((job) => (job.kind === "parse" || job.kind === "parse_local") && ["queued", "running"].includes(job.status));
   const parseJobByPaper = new Map(parseJobs.map((job) => [job.paper_id, job]));
   const [parseProgress, setParseProgress] = useState<Record<string, ParseProgress>>({});
   const updateParseProgress = (id: string, progress: ParseProgress) => {

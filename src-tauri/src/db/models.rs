@@ -41,6 +41,8 @@ pub struct Paper {
     pub total_read_seconds: i64,
     /// 所属文件夹 id 列表（多归属；空数组 = 未分类）。由 list/get 聚合填充。
     pub folder_ids: Vec<String>,
+    /// 正文抽取来源：`local`（本机提取）/ `mineru`（云端解析）/ None（尚未解析）。
+    pub parse_engine: Option<String>,
 }
 
 /// 计划条目：指派论文清单中的一篇论文，带条目级截止日期（提醒事项式）。

@@ -293,7 +293,8 @@ const PAPER_SELECT: &str = "
            (SELECT COALESCE(SUM(rs.seconds), 0) FROM reading_sessions rs WHERE rs.paper_id = p.id),
            p.source_url, p.github_url, p.venue, p.deleted_at, p.source_icon_url,
            p.title_zh, p.abstract_zh,
-           GROUP_CONCAT(pf.folder_id)
+           GROUP_CONCAT(pf.folder_id),
+           p.parse_engine
     FROM papers p
     LEFT JOIN paper_folders pf ON pf.paper_id = p.id
 ";
@@ -331,6 +332,7 @@ fn row_to_paper(row: &rusqlite::Row) -> rusqlite::Result<Paper> {
         deleted_at: row.get(17)?,
         source_icon_url: row.get(18)?,
         folder_ids,
+        parse_engine: row.get(22)?,
     })
 }
 
@@ -652,6 +654,7 @@ fn import_pdf_inner_with_metadata(
         }),
         total_read_seconds: 0,
         folder_ids: vec![],
+        parse_engine: None,
     };
 
     let conn = db.conn();
@@ -1473,13 +1476,29 @@ impl Drop for ParseFailGuard<'_> {
     }
 }
 
-/// 调用 MinerU 解析论文 Markdown 并更新状态。
+/// 开始解析论文 Markdown 并更新状态。
+///
+/// 正文抽取有两种来源：`local` 由前端用 pdf.js 在本机提取（不需要任何 Key），
+/// `mineru` 交给后台 worker 走云端结构化解析。默认是 local，用户可以在设置里切换。
 #[tauri::command]
 pub async fn parse_pdf(
     db: State<'_, Db>,
     paper_id: String,
     on_progress: tauri::ipc::Channel<crate::ai::mineru::ParseProgress>,
 ) -> Result<Paper, String> {
+    let engine = Settings::load()
+        .map_err(|e| e.to_string())?
+        .workflow
+        .engine();
+    if engine == crate::settings::PARSE_ENGINE_LOCAL {
+        begin_local_parse(&db, &paper_id)?;
+        let _ = on_progress.send(crate::ai::mineru::ParseProgress {
+            stage: "queued".into(),
+            extracted_pages: None,
+            total_pages: None,
+        });
+        return get_paper_inner(&db, &paper_id);
+    }
     crate::jobs::enqueue(&db, &paper_id, "parse")?;
     let _ = on_progress.send(crate::ai::mineru::ParseProgress {
         stage: "queued".into(),
@@ -1487,6 +1506,108 @@ pub async fn parse_pdf(
         total_pages: None,
     });
     get_paper_inner(&db, &paper_id)
+}
+
+/// 排队一次本机正文提取：标记解析中、作废同篇论文其它未完成任务，并联入 `parse_local`。
+///
+/// 真正的提取在 WebView 里执行（pdf.js 已在包内），完成后由前端调用
+/// [`save_local_parse`] 落盘。Rust 端不领取这类任务，只维护状态与进度。
+fn begin_local_parse(db: &Db, paper_id: &str) -> Result<(), String> {
+    crate::jobs::enqueue(db, paper_id, "parse_local")?;
+    let conn = db.conn();
+    conn.execute(
+        "UPDATE papers SET parse_status = 'parsing', parse_revision = parse_revision + 1 WHERE id = ?1",
+        [paper_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "UPDATE background_jobs SET status=CASE status WHEN 'running' THEN 'canceling' ELSE 'canceled' END \
+         WHERE paper_id=?1 AND kind!='parse_local' AND status IN ('queued','running')",
+        [paper_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 保存本机提取结果：`paper.md` + `content_list.json`，更新元数据与解析状态，
+/// 然后像云端解析一样派发后续任务（向量索引、元数据翻译、DOI 补全、全文翻译）。
+///
+/// 这里先把正文分块写进 `paper_chunks`，所以即使向量模型没下载成功，
+/// 章节树、测验选题和关键词搜索也已经可用。
+#[tauri::command]
+pub fn save_local_parse(
+    db: State<'_, Db>,
+    paper_id: String,
+    markdown: String,
+    content_list: String,
+) -> Result<Paper, String> {
+    save_local_parse_inner(&db, &paper_id, &markdown, &content_list)?;
+    get_paper_inner(&db, &paper_id)
+}
+
+pub(crate) fn save_local_parse_inner(
+    db: &Db,
+    paper_id: &str,
+    markdown: &str,
+    content_list: &str,
+) -> Result<(), String> {
+    if markdown.trim().is_empty() {
+        return Err(
+            "本机提取没有得到任何正文文本。这份 PDF 可能是扫描件，请在设置中改用 MinerU 云端解析。"
+                .into(),
+        );
+    }
+    let blocks: Vec<crate::rag::ContentBlock> = serde_json::from_str(content_list)
+        .map_err(|e| format!("本机提取的结构化结果不合法：{e}"))?;
+
+    let (md_path, current_title): (String, String) = {
+        let conn = db.conn();
+        conn.query_row(
+            "SELECT md_path, title FROM papers WHERE id = ?1",
+            [paper_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| e.to_string())?
+    };
+    let md_path = Path::new(&md_path);
+    crate::fs::write_md(md_path, markdown).map_err(|e| e.to_string())?;
+    let paper_dir = md_path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::write(paper_dir.join("content_list.json"), content_list)
+        .map_err(|e| format!("写入 content_list.json 失败：{e}"))?;
+
+    let (extracted_title, authors, abstract_text) = extract_metadata(markdown);
+    // 只在标题还是“文件名/未命名”时才用正文标题覆盖，避免吞掉用户改名。
+    let title_is_placeholder = current_title.trim().is_empty()
+        || current_title == "未命名论文"
+        || current_title.to_lowercase().ends_with(".pdf");
+    let title = if title_is_placeholder {
+        extracted_title
+    } else {
+        current_title
+    };
+    let github_url = extract_github_repo_url(markdown);
+
+    let drafts = crate::rag::chunk_content_list(&blocks);
+    {
+        let conn = db.conn();
+        conn.execute(
+            "UPDATE papers SET parse_status = 'ready', parse_engine = 'local', title = ?2, \
+             authors = COALESCE(?3, authors), abstract = ?4, title_zh = NULL, abstract_zh = NULL, \
+             github_url = COALESCE(github_url, ?5) WHERE id = ?1",
+            params![paper_id, title, authors, abstract_text, github_url],
+        )
+        .map_err(|e| e.to_string())?;
+        // 只写文本分块；向量由 index 任务补，失败也不影响章节与关键词检索。
+        crate::rag::replace_chunks(&conn, paper_id, &drafts).map_err(|e| e.to_string())?;
+    }
+
+    for kind in ["index", "translate", "doi", "full_translation"] {
+        if !crate::jobs::follow_up_enabled(kind) {
+            continue;
+        }
+        let _ = crate::jobs::enqueue(db, paper_id, kind);
+    }
+    Ok(())
 }
 
 pub(crate) async fn parse_background(
@@ -1549,7 +1670,7 @@ pub(crate) async fn parse_background(
     {
         let conn = db.conn();
         conn.execute(
-            "UPDATE papers SET parse_status = 'ready', title = ?2, authors = COALESCE(?3, authors), abstract = ?4, \
+            "UPDATE papers SET parse_status = 'ready', parse_engine = 'mineru', title = ?2, authors = COALESCE(?3, authors), abstract = ?4, \
              title_zh = NULL, abstract_zh = NULL, \
              github_url = COALESCE(github_url, ?5), venue = COALESCE(venue, ?6) \
              WHERE id = ?1",
@@ -2661,18 +2782,48 @@ pub(crate) async fn index_background(
         )
         .map_err(|e| e.to_string())?;
     let md_path = get_paper_inner(db, paper_id)?.md_path;
-    let (drafts, embeddings) =
-        tokio::task::spawn_blocking(move || crate::rag::prepare_index(&md_path))
-            .await
-            .map_err(|e| e.to_string())?
+    let drafts = tokio::task::spawn_blocking(move || crate::rag::prepare_chunks(&md_path))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
+    if canceled.load(Ordering::Relaxed) {
+        return Err("索引已取消".into());
+    }
+    {
+        let conn = db.conn();
+        let current: i64 = conn
+            .query_row(
+                "SELECT parse_revision FROM papers WHERE id=?1",
+                [paper_id],
+                |r| r.get(0),
+            )
             .map_err(|e| e.to_string())?;
+        if current != revision {
+            return Err("正文已更新，已丢弃旧索引".into());
+        }
+        // 先落正文分块：向量化失败或取消时，章节树、关键词与测验选题仍然可用。
+        crate::rag::replace_chunks(&conn, paper_id, &drafts).map_err(|e| e.to_string())?;
+    }
+    if drafts.is_empty() {
+        return Ok(0);
+    }
+    // 向量化是慢的阻塞推理，不持数据库锁。
+    let texts: Vec<String> = drafts.iter().map(|d| d.content.clone()).collect();
+    let embeddings = tokio::task::spawn_blocking(move || {
+        let mut out: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+        for batch in texts.chunks(32) {
+            let refs: Vec<&str> = batch.iter().map(String::as_str).collect();
+            out.extend(crate::ai::embed::embed_texts(&refs)?);
+        }
+        anyhow::Ok(out)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| format!("向量索引失败：{e}（正文分块已保存，关键词搜索仍可用）"))?;
     if canceled.load(Ordering::Relaxed) {
         return Err("索引已取消".into());
     }
     let conn = db.conn();
-    if canceled.load(Ordering::Relaxed) {
-        return Err("索引已取消".into());
-    }
     let current: i64 = conn
         .query_row(
             "SELECT parse_revision FROM papers WHERE id=?1",
@@ -2683,7 +2834,7 @@ pub(crate) async fn index_background(
     if current != revision {
         return Err("正文已更新，已丢弃旧索引".into());
     }
-    crate::rag::insert_chunks(&conn, &paper_id, &drafts, &embeddings).map_err(|e| e.to_string())?;
+    crate::rag::attach_embeddings(&conn, paper_id, &embeddings).map_err(|e| e.to_string())?;
     Ok(drafts.len())
 }
 
@@ -5331,6 +5482,112 @@ mod tests {
         .unwrap();
         assert_eq!(plan.items.len(), 2);
         assert!(plan.items.iter().any(|i| i.paper_id == "p3"));
+    }
+
+    /// 建一个临时论文库并导入一篇 PDF，返回 (db, 论文, 临时目录)。
+    fn local_parse_fixture() -> (Db, Paper, std::path::PathBuf) {
+        db::register_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        db::migrations::migrate(&conn).unwrap();
+        let db = db::Db::from_connection(conn);
+        let tmp = std::env::temp_dir().join(format!("zoompaper-local-{}", uuid::Uuid::new_v4()));
+        let library = tmp.join("papers");
+        let src = tmp.join("download.pdf");
+        fs::create_dir_all(&library).unwrap();
+        fs::write(&src, b"%PDF-1.4 test").unwrap();
+        let paper = import_pdf_inner(&db, &library, src.to_str().unwrap()).unwrap();
+        (db, paper, tmp)
+    }
+
+    fn sample_content_list() -> String {
+        serde_json::json!([
+            {"type": "text", "text": "Attention Is All You Need", "text_level": 1, "page_idx": 0},
+            {"type": "text", "text": "We propose the Transformer.", "page_idx": 0},
+            {"type": "text", "text": "1 Introduction", "text_level": 1, "page_idx": 1},
+            {"type": "text", "text": "Recurrent networks are slow.", "page_idx": 1}
+        ])
+        .to_string()
+    }
+
+    /// 本机提取的核心契约：不需要 Key、落盘两份文件、立即有可检索的正文分块，
+    /// 并且不在保存阶段生成向量（向量留给 index 任务，失败也不影响阅读）。
+    #[test]
+    fn local_parse_saves_files_and_chunks_without_vectors() {
+        let (db, paper, tmp) = local_parse_fixture();
+        let markdown = "# Attention Is All You Need\n\nAshish Vaswani\n\n## Abstract\n\nWe propose the Transformer.\n\n## 1 Introduction\n\nRecurrent networks are slow.";
+        save_local_parse_inner(&db, &paper.id, markdown, &sample_content_list()).unwrap();
+
+        let saved = get_paper_inner(&db, &paper.id).unwrap();
+        assert_eq!(saved.parse_status, "ready");
+        assert_eq!(saved.parse_engine.as_deref(), Some("local"));
+        // 导入时标题来自文件名 download.pdf，被正文标题替换。
+        assert_eq!(saved.title, "Attention Is All You Need");
+        assert!(saved
+            .abstract_text
+            .as_deref()
+            .unwrap_or_default()
+            .contains("Transformer"));
+
+        let md_path = Path::new(&saved.md_path).to_path_buf();
+        assert_eq!(crate::fs::read_md(&md_path).unwrap(), markdown);
+        assert!(md_path.parent().unwrap().join("content_list.json").exists());
+
+        let chunks: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM paper_chunks WHERE paper_id=?1",
+                [&paper.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(chunks > 0, "正文分块应立即入库");
+        let vectors: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM vec_chunks WHERE paper_id=?1",
+                [&paper.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vectors, 0, "保存阶段不应生成向量");
+
+        // 后续任务（向量索引等）已按流程排队。
+        let jobs = crate::jobs::snapshot(&db).unwrap();
+        assert!(jobs
+            .iter()
+            .any(|j| j.paper_id == paper.id && j.kind == "index"));
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn local_parse_rejects_text_free_documents_and_keeps_status() {
+        let (db, paper, tmp) = local_parse_fixture();
+        let error = save_local_parse_inner(&db, &paper.id, "   \n\n  ", "[]").unwrap_err();
+        assert!(error.contains("扫描件"), "错误信息应提示扫描件，实际：{error}");
+        assert_eq!(
+            get_paper_inner(&db, &paper.id).unwrap().parse_status,
+            "unparsed"
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// 排队本机解析要立刻把状态改成“解析中”，并作废同篇论文的其它旧任务，
+    /// 否则界面会把上一次的失败状态一直显示下去。
+    #[test]
+    fn queued_local_parse_marks_parsing_and_cancels_other_stages() {
+        let (db, paper, tmp) = local_parse_fixture();
+        let doi = crate::jobs::enqueue(&db, &paper.id, "doi").unwrap();
+        begin_local_parse(&db, &paper.id).unwrap();
+        assert_eq!(
+            get_paper_inner(&db, &paper.id).unwrap().parse_status,
+            "parsing"
+        );
+        let jobs = crate::jobs::snapshot(&db).unwrap();
+        assert!(jobs
+            .iter()
+            .any(|j| j.id != doi && j.kind == "parse_local" && j.status == "queued"));
+        assert_eq!(jobs.iter().find(|j| j.id == doi).unwrap().status, "canceled");
+        fs::remove_dir_all(&tmp).ok();
     }
 }
 

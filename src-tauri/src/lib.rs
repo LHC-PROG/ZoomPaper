@@ -19,6 +19,18 @@ mod translate;
 
 use tauri::Manager;
 
+/// 默认构建不带控制台，panic 信息会完全丢失。把它写到数据目录，方便事后排查。
+fn install_crash_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(dir) = settings::app_data_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join("last-crash.txt"), format!("{info}\n"));
+        }
+        previous(info);
+    }));
+}
+
 /// 启用 WKWebView 的原生捏合放大，使双指捏合以 `gesturestart/change/end` 事件浮出，
 /// 前端再 `preventDefault()` 抑制原生整页缩放并用 `e.scale` 驱动自有缩放。
 #[cfg(target_os = "macos")]
@@ -34,6 +46,7 @@ fn enable_pinch_zoom(app: &tauri::App) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    install_crash_log();
     let builder = tauri::Builder::default();
     #[cfg(desktop)]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -103,6 +116,9 @@ pub fn run() {
             commands::list_custom_themes,
             commands::enqueue_metadata_translations,
             jobs::claim_frontend_translation,
+            jobs::claim_frontend_job,
+            jobs::report_job_progress,
+            jobs::finish_frontend_job,
             jobs::finish_frontend_translation,
             storage::export_library_backup,
             storage::stage_library_restore,
@@ -127,6 +143,7 @@ pub fn run() {
             commands::import_browser_download,
             commands::import_pdf_url,
             commands::parse_pdf,
+            commands::save_local_parse,
             jobs::list_jobs,
             jobs::cancel_job,
             jobs::retry_job,

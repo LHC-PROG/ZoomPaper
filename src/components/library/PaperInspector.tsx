@@ -114,7 +114,7 @@ export function PaperInspector({ paper, folders, onClose, onOpen, onToggleStar, 
 
         <dl className="mt-5 grid grid-cols-[72px_1fr] gap-x-3 gap-y-2 text-xs">
           <dt className="text-zp-quaternary">状态</dt><dd className="text-zp-secondary">{{ unread: "未读", reading: "在读", read: "已读" }[previewPaper.reading_status] ?? "未读"}</dd>
-          <dt className="text-zp-quaternary">解析</dt><dd className="text-zp-secondary">{{ ready: "已解析", parsing: "解析中", failed: "解析失败", unparsed: "未解析" }[previewPaper.parse_status] ?? "未解析"}</dd>
+          <dt className="text-zp-quaternary">解析</dt><dd className="text-zp-secondary">{{ ready: "已解析", parsing: "解析中", failed: "解析失败", unparsed: "未解析" }[previewPaper.parse_status] ?? "未解析"}{previewPaper.parse_status === "ready" && previewPaper.parse_engine === "local" ? "（本机提取）" : previewPaper.parse_status === "ready" && previewPaper.parse_engine === "mineru" ? "（MinerU）" : ""}</dd>
           <dt className="text-zp-quaternary">阅读时长</dt><dd className="text-zp-secondary">{formatDuration(previewPaper.total_read_seconds)}</dd>
           <dt className="text-zp-quaternary">最后阅读</dt><dd className="text-zp-secondary">{previewPaper.last_read_at ? formatTime(previewPaper.last_read_at) : "—"}</dd>
           <dt className="text-zp-quaternary">文件夹</dt><dd className="text-zp-secondary">{names.join("、") || "未分类"}</dd>

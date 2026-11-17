@@ -20,8 +20,8 @@ export interface ProviderConfig {
   enabled: boolean;
 }
 
-export interface WorkflowSettings { autoParse: boolean; parseConcurrency: number; autoDoi: boolean; autoMetadataTranslation: boolean; autoFullTranslation: boolean; }
-export const DEFAULT_WORKFLOW: WorkflowSettings = {autoParse:true,parseConcurrency:2,autoDoi:true,autoMetadataTranslation:true,autoFullTranslation:false};
+export interface WorkflowSettings { autoParse: boolean; parseConcurrency: number; autoDoi: boolean; autoMetadataTranslation: boolean; autoFullTranslation: boolean; parseEngine: "local" | "mineru"; }
+export const DEFAULT_WORKFLOW: WorkflowSettings = {autoParse:true,parseConcurrency:2,autoDoi:true,autoMetadataTranslation:true,autoFullTranslation:false,parseEngine:"local"};
 export interface Settings {
   workflow?: WorkflowSettings;
   providers: ProviderConfig[];
@@ -71,6 +71,8 @@ export interface Paper {
   total_read_seconds: number;
   /** 所属文件夹 id 列表（多归属；空数组 = 未分类） */
   folder_ids: string[];
+  /** 正文抽取来源：local（本机提取）/ mineru（云端解析）/ null（尚未解析） */
+  parse_engine: string | null;
 }
 
 /** 虚拟文件夹（多归属集合式整理容器；不对应磁盘目录） */
@@ -699,7 +701,7 @@ export const quizDelete = (quizId: string) =>
 export const reindexAllPapers = () => invoke<[number, number]>("reindex_all_papers");
 
 export interface BackgroundJob {
-  id: string; paper_id: string; title: string; kind: "parse" | "index" | "translate" | "doi" | "full_translation";
+  id: string; paper_id: string; title: string; kind: "parse" | "parse_local" | "index" | "translate" | "doi" | "full_translation";
   status: "queued" | "running" | "canceling" | "done" | "failed" | "canceled";
   stage: string; completed_pages: number | null; total_pages: number | null;
   error: string | null; created_at: number; updated_at: number;
@@ -707,6 +709,18 @@ export interface BackgroundJob {
 export const listJobs = () => invoke<BackgroundJob[]>("list_jobs");
 export const cancelJob = (jobId: string) => invoke<void>("cancel_job", { jobId });
 export const retryJob = (jobId: string) => invoke<void>("retry_job", { jobId });
+
+/** 前端执行的任务（全文翻译、本机解析）由 WebView 领取。 */
+export const claimFrontendJob = (jobId: string) => invoke<boolean>("claim_frontend_job", { jobId });
+/** 上报进度；返回 false 表示任务已被取消，调用方应停止。 */
+export const reportJobProgress = (jobId: string, stage: string, completedPages: number | null, totalPages: number | null) =>
+  invoke<boolean>("report_job_progress", { jobId, stage, completedPages, totalPages });
+export const finishFrontendJob = (jobId: string, error: string | null) =>
+  invoke<void>("finish_frontend_job", { jobId, error });
+
+/** 保存本机提取的正文：写入 paper.md 与 content_list.json，并把论文标记为已解析。 */
+export const saveLocalParse = (paperId: string, markdown: string, contentList: string) =>
+  invoke<Paper>("save_local_parse", { paperId, markdown, contentList });
 
 export const enqueueMetadataTranslations = (paperIds: string[]) => invoke<void>("enqueue_metadata_translations", {paperIds});
 

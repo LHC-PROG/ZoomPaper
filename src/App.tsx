@@ -13,7 +13,8 @@ import { type BrowserImportPhase } from "@/components/BrowserImportNotice";
 import { translationJobs } from "@/lib/translationJobs";
 import { invoke } from "@tauri-apps/api/core";
 import { isViewPreferenceKey } from "@/lib/preferences";
-import { getPaperMd, getTranslation } from "@/lib/api";
+import { getPaperMd, getTranslation, getPaper, claimFrontendJob, reportJobProgress, finishFrontendJob, saveLocalParse } from "@/lib/api";
+import { extractPdfText } from "@/lib/localParse";
 import { importBrowserDownload, importPdfUrl, listJobs, type BackgroundJob } from "@/lib/api";
 import { CompanionBridge } from "@/components/CompanionWindow";
 
@@ -39,6 +40,8 @@ function App() {
   } | null>(null);
   const [jobs, setJobs] = useState<BackgroundJob[]>([]);
   const [readingTitle, setReadingTitle] = useState("");
+  // 本机解析一次只跑一篇：pdf.js 解码整份 PDF 会占用内存，并发没有收益。
+  const parsingLocal = useRef(false);
   useEffect(() => {
     let stopped = false; let timer: ReturnType<typeof setTimeout>; let previous = ""; let revision = "";
     const poll = async () => {
@@ -52,6 +55,27 @@ function App() {
             try{const [md,cached]=await Promise.all([getPaperMd(job.paper_id),getTranslation(job.paper_id)]);await translationJobs.start(job.paper_id,md,cached);}catch(e){error=String(e);}
             await invoke("finish_frontend_translation",{jobId:job.id,error});
           }).catch(()=>{});
+        }
+        for(const job of next.filter(j=>j.kind==="parse_local"&&j.status==="queued")) {
+          if (parsingLocal.current) break;
+          parsingLocal.current = true;
+          void claimFrontendJob(job.id).then(async claimed=>{
+            if(!claimed){parsingLocal.current=false;return;}
+            let error:string|null=null;
+            try{
+              const paper = await getPaper(job.paper_id);
+              const result = await extractPdfText(paper.pdf_path, {
+                fallbackTitle: paper.title.replace(/\.pdf$/i, ""),
+                onPage: async (done,total)=>{
+                  // 进度上报同时承担取消检测：任务被取消时后端返回 false。
+                  if (!(await reportJobProgress(job.id,"extract",done,total))) throw new Error("解析已取消");
+                },
+              });
+              await saveLocalParse(job.paper_id, result.markdown, result.contentList);
+            }catch(e){error=String(e);}
+            finally{parsingLocal.current=false;}
+            await finishFrontendJob(job.id,error).catch(()=>{});
+          }).catch(()=>{parsingLocal.current=false;});
         }
         const signature = JSON.stringify(next);
         if (signature !== previous) {

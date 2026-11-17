@@ -184,6 +184,19 @@ fn content_list_supports_plain_and_prefixed_mineru_names() {
     fs::remove_dir(dir).unwrap();
 }
 
+/// 只读 content_list.json 得到分块，不做向量化。
+///
+/// 本机提取正文后可以立即调用：章节树、章节全文、测验选题与关键词搜索
+/// 都只依赖 `paper_chunks`，不依赖向量表。向量化失败不应让这些功能一起失效。
+pub fn prepare_chunks(md_path: &str) -> Result<Vec<ChunkDraft>> {
+    let paper_dir = Path::new(&md_path).parent().context("md_path 无父目录")?;
+    let cl_path = find_content_list(paper_dir)?;
+    let raw = fs::read_to_string(&cl_path).context("读取 content_list.json 失败")?;
+    let blocks: Vec<ContentBlock> =
+        serde_json::from_str(&raw).context("解析 content_list.json 失败")?;
+    Ok(chunk_content_list(&blocks))
+}
+
 /// 索引一篇论文：分块 → embedding → 入库。返回 chunk 数量。
 pub fn index_paper(conn: &Connection, paper_id: &str) -> Result<usize> {
     let md_path: String = conn
@@ -198,16 +211,69 @@ pub fn index_paper(conn: &Connection, paper_id: &str) -> Result<usize> {
     Ok(drafts.len())
 }
 
+/// 只写正文分块（删除该论文旧分块与旧向量），不生成向量。
+pub fn replace_chunks(conn: &Connection, paper_id: &str, drafts: &[ChunkDraft]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM paper_chunks WHERE paper_id = ?1)",
+        [paper_id],
+    )?;
+    tx.execute("DELETE FROM paper_chunks WHERE paper_id = ?1", [paper_id])?;
+    for draft in drafts {
+        tx.execute(
+            "INSERT INTO paper_chunks (paper_id, section, content, start_line, end_line, \
+             page_idx, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                paper_id,
+                draft.section,
+                draft.content,
+                draft.start_block,
+                draft.end_block,
+                draft.page_idx,
+                draft.bbox,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// 给已存在的分块按 id 顺序补写向量（先清掉该论文旧向量）。
+pub fn attach_embeddings(
+    conn: &Connection,
+    paper_id: &str,
+    embeddings: &[Vec<f32>],
+) -> Result<()> {
+    let ids: Vec<i64> = {
+        let mut stmt =
+            conn.prepare("SELECT id FROM paper_chunks WHERE paper_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([paper_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    anyhow::ensure!(
+        ids.len() == embeddings.len(),
+        "分块与向量数量不一致（{} vs {}）",
+        ids.len(),
+        embeddings.len()
+    );
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
+        "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM paper_chunks WHERE paper_id = ?1)",
+        [paper_id],
+    )?;
+    for (id, embedding) in ids.iter().zip(embeddings) {
+        tx.execute(
+            "INSERT INTO vec_chunks (rowid, embedding, paper_id) VALUES (?1, ?2, ?3)",
+            params![id, embedding.as_bytes(), paper_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// File IO and model inference must run without the shared database mutex.
 pub fn prepare_index(md_path: &str) -> Result<(Vec<ChunkDraft>, Vec<Vec<f32>>)> {
-    let paper_dir = Path::new(&md_path).parent().context("md_path 无父目录")?;
-
-    let cl_path = find_content_list(paper_dir)?;
-    let raw = fs::read_to_string(&cl_path).context("读取 content_list.json 失败")?;
-    let blocks: Vec<ContentBlock> =
-        serde_json::from_str(&raw).context("解析 content_list.json 失败")?;
-
-    let drafts = chunk_content_list(&blocks);
+    let drafts = prepare_chunks(md_path)?;
     if drafts.is_empty() {
         return Ok((vec![], vec![]));
     }
@@ -235,36 +301,8 @@ pub fn insert_chunks(
         "chunks 与 embeddings 数量不一致"
     );
 
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM vec_chunks WHERE rowid IN (SELECT id FROM paper_chunks WHERE paper_id = ?1)",
-        [paper_id],
-    )?;
-    tx.execute("DELETE FROM paper_chunks WHERE paper_id = ?1", [paper_id])?;
-
-    for (draft, embedding) in drafts.iter().zip(embeddings) {
-        tx.execute(
-            "INSERT INTO paper_chunks (paper_id, section, content, start_line, end_line, \
-             page_idx, bbox) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                paper_id,
-                draft.section,
-                draft.content,
-                draft.start_block,
-                draft.end_block,
-                draft.page_idx,
-                draft.bbox,
-            ],
-        )?;
-        let chunk_id = tx.last_insert_rowid();
-
-        tx.execute(
-            "INSERT INTO vec_chunks (rowid, embedding, paper_id) VALUES (?1, ?2, ?3)",
-            params![chunk_id, embedding.as_bytes(), paper_id],
-        )?;
-    }
-
-    tx.commit()?;
+    replace_chunks(conn, paper_id, drafts)?;
+    attach_embeddings(conn, paper_id, embeddings)?;
     Ok(())
 }
 
@@ -593,8 +631,39 @@ mod tests {
         assert!(filtered.is_empty());
     }
 
-    fn insert_chunks_with_sections(conn: &Connection, sections: &[(&str, &str)]) {
-        let drafts: Vec<ChunkDraft> = sections
+    /// 正文分块可以先入库、向量后补：本机解析在模型下载失败时仍要能看书、查章节。
+    #[test]
+    fn chunks_index_without_vectors_then_attach_later() {
+        let conn = setup_db();
+        let drafts = vec![ChunkDraft {
+            section: "Intro".into(),
+            content: "alpha chunk".into(),
+            start_block: 0,
+            end_block: 1,
+            page_idx: Some(0),
+            bbox: None,
+        }];
+        replace_chunks(&conn, "paper-a", &drafts).unwrap();
+
+        // 没有向量时：章节树可用，语义检索查不到该论文（而不是报错）。
+        assert_eq!(
+            sections_for_paper(&conn, "paper-a").unwrap(),
+            vec!["Intro".to_string()]
+        );
+        assert!(search_with_embedding(&conn, &vec![0.0f32; 384], 5, None)
+            .unwrap()
+            .is_empty());
+
+        attach_embeddings(&conn, "paper-a", &[vec![0.0f32; 384]]).unwrap();
+        let hits = search_with_embedding(&conn, &vec![0.0f32; 384], 5, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].content, "alpha chunk");
+
+        // 数量不一致必须报错，不能错位写入向量。
+        assert!(attach_embeddings(&conn, "paper-a", &[]).is_err());
+    }
+
+    fn insert_chunks_with_sections(conn: &Connection, sections: &[(&str, &str)]) {        let drafts: Vec<ChunkDraft> = sections
             .iter()
             .map(|(s, c)| ChunkDraft {
                 section: s.to_string(),

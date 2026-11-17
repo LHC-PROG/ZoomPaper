@@ -85,6 +85,8 @@ pub struct WorkflowSettings {
     pub auto_doi: bool,
     pub auto_metadata_translation: bool,
     pub auto_full_translation: bool,
+    /// 正文抽取方式：`local`（本机提取，无需 API Key，默认）/ `mineru`（云端结构化解析）。
+    pub parse_engine: String,
 }
 impl Default for WorkflowSettings {
     fn default() -> Self {
@@ -94,6 +96,22 @@ impl Default for WorkflowSettings {
             auto_doi: true,
             auto_metadata_translation: true,
             auto_full_translation: false,
+            parse_engine: PARSE_ENGINE_LOCAL.to_string(),
+        }
+    }
+}
+
+/// 本机提取正文：不联网、不需要 Key，图片/表格结构会丢失。
+pub const PARSE_ENGINE_LOCAL: &str = "local";
+/// MinerU 云端解析：正文更完整（公式、表格、图片），需要 API Key 并按量计费。
+pub const PARSE_ENGINE_MINERU: &str = "mineru";
+
+impl WorkflowSettings {
+    /// 归一化解析引擎取值，未知值一律回退到本机提取。
+    pub fn engine(&self) -> &'static str {
+        match self.parse_engine.as_str() {
+            PARSE_ENGINE_MINERU => PARSE_ENGINE_MINERU,
+            _ => PARSE_ENGINE_LOCAL,
         }
     }
 }

@@ -476,7 +476,7 @@ mod tests {
     }
 }
 
-fn follow_up_enabled(kind: &str) -> bool {
+pub(crate) fn follow_up_enabled(kind: &str) -> bool {
     let w = crate::settings::Settings::load()
         .unwrap_or_default()
         .workflow;
@@ -516,22 +516,106 @@ mod concurrency_tests {
 
 #[tauri::command]
 pub fn claim_frontend_translation(db: State<'_, Db>, job_id: String) -> Result<bool, String> {
+    claim_frontend_job(db, job_id)
+}
+
+/// 前端执行的任务类型：全文翻译在阅读器里跑，本机解析在主窗口里跑。
+/// 这两类任务的 worker 在 WebView 内，Rust 端只负责排队与状态。
+const FRONTEND_KINDS: &str = "('full_translation','parse_local')";
+
+/// 前端领取一个排队中的任务；返回 false 表示已被取消或抢走，调用方应放弃。
+#[tauri::command]
+pub fn claim_frontend_job(db: State<'_, Db>, job_id: String) -> Result<bool, String> {
     if crate::storage::MAINTENANCE.load(Ordering::SeqCst) {
         return Ok(false);
     }
     let conn = db.conn();
-    if crate::storage::MAINTENANCE.load(Ordering::SeqCst) { return Ok(false); }
-    let changed=conn.execute("UPDATE background_jobs SET status='running',stage='translate',updated_at=?2 WHERE id=?1 AND kind='full_translation' AND status='queued'",params![job_id,chrono::Utc::now().timestamp()]).map_err(|e|e.to_string())?;
+    if crate::storage::MAINTENANCE.load(Ordering::SeqCst) {
+        return Ok(false);
+    }
+    let changed = conn
+        .execute(
+            &format!(
+                "UPDATE background_jobs SET status='running', \
+                 stage=CASE kind WHEN 'parse_local' THEN 'extract' ELSE 'translate' END, \
+                 updated_at=?2 WHERE id=?1 AND kind IN {FRONTEND_KINDS} AND status='queued'"
+            ),
+            params![job_id, chrono::Utc::now().timestamp()],
+        )
+        .map_err(|e| e.to_string())?;
     Ok(changed == 1)
 }
-fn finish_status(db: &Db, job_id: &str, error: Option<String>) {
-    // 用户可能在翻译进行中取消：此时行是 canceling，若只接受 running，
-    // 收尾会变成 no-op，任务会永远停在 canceling 并让备份/恢复被一直拒绝。
+
+/// 前端上报进度；返回 false 表示任务已被取消或不再属于前端执行。
+#[tauri::command]
+pub fn report_job_progress(
+    db: State<'_, Db>,
+    job_id: String,
+    stage: String,
+    completed_pages: Option<u32>,
+    total_pages: Option<u32>,
+) -> Result<bool, String> {
+    let conn = db.conn();
+    conn.execute(
+        &format!("UPDATE background_jobs SET stage=?2,completed_pages=?3,total_pages=?4,updated_at=?5 WHERE id=?1 AND status='running' AND kind IN {FRONTEND_KINDS}"),
+        params![job_id, stage, completed_pages, total_pages, chrono::Utc::now().timestamp()],
+    )
+    .map_err(|e| e.to_string())?;
+    let running: bool = conn
+        .query_row(
+            "SELECT status='running' FROM background_jobs WHERE id=?1",
+            [&job_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    Ok(running)
+}
+
+/// 前端任务收尾。解析任务未成功时把论文状态从 `parsing` 收回 `failed`，
+/// 否则界面会一直显示「解析中」，重试按钮也不会出现。
+#[tauri::command]
+pub fn finish_frontend_job(
+    db: State<'_, Db>,
+    job_id: String,
+    error: Option<String>,
+) -> Result<(), String> {
+    finish_frontend_job_inner(&db, &job_id, error)
+}
+
+fn finish_frontend_job_inner(db: &Db, job_id: &str, error: Option<String>) -> Result<(), String> {
+    let conn = db.conn();
     let state = if error.is_some() { "failed" } else { "done" };
-    let _ = db.conn().execute(
-        "UPDATE background_jobs SET status=CASE WHEN status='canceling' THEN 'canceled' ELSE ?2 END,error=?3,updated_at=?4 WHERE id=?1 AND kind='full_translation' AND status IN ('running','canceling')",
+    conn.execute(
+        &format!(
+            "UPDATE background_jobs SET status=CASE WHEN status='canceling' THEN 'canceled' ELSE ?2 END,\
+             error=?3,updated_at=?4 WHERE id=?1 AND kind IN {FRONTEND_KINDS} AND status IN ('running','canceling')"
+        ),
         params![job_id, state, error, chrono::Utc::now().timestamp()],
-    );
+    )
+    .map_err(|e| e.to_string())?;
+    let row: Option<(String, String, String)> = conn
+        .query_row(
+            "SELECT kind, paper_id, status FROM background_jobs WHERE id=?1",
+            [job_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+    if let Some((kind, paper_id, status)) = row {
+        if kind == "parse_local" && status != "done" {
+            conn.execute(
+                "UPDATE papers SET parse_status='failed' WHERE id=?1 AND parse_status='parsing'",
+                [&paper_id],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
+/// 兼容旧调用点（单元测试与翻译收尾共用同一套状态收敛规则）。
+#[cfg(test)]
+fn finish_status(db: &Db, job_id: &str, error: Option<String>) {
+    let _ = finish_frontend_job_inner(db, job_id, error);
 }
 #[tauri::command]
 pub fn finish_frontend_translation(
@@ -539,6 +623,5 @@ pub fn finish_frontend_translation(
     job_id: String,
     error: Option<String>,
 ) -> Result<(), String> {
-    finish_status(&db, &job_id, error);
-    Ok(())
+    finish_frontend_job(db, job_id, error)
 }
