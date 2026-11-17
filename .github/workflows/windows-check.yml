@@ -1,4 +1,4 @@
-name: Windows compatibility
+name: Cross-platform checks
 on:
   push:
     branches: [main, dev]
@@ -7,8 +7,14 @@ on:
 permissions:
   contents: read
 jobs:
-  windows:
-    runs-on: windows-latest
+  checks:
+    name: checks (${{ matrix.os }})
+    strategy:
+      # 两个平台互不阻塞：Windows 回归不应掩盖 macOS 的失败信息。
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
