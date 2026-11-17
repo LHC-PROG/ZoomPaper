@@ -719,8 +719,8 @@ export const finishFrontendJob = (jobId: string, error: string | null) =>
   invoke<void>("finish_frontend_job", { jobId, error });
 
 /** 保存本机提取的正文：写入 paper.md 与 content_list.json，并把论文标记为已解析。 */
-export const saveLocalParse = (paperId: string, markdown: string, contentList: string) =>
-  invoke<Paper>("save_local_parse", { paperId, markdown, contentList });
+export const saveLocalParse = (paperId: string, markdown: string, contentList: string, authors: string) =>
+  invoke<Paper>("save_local_parse", { paperId, markdown, contentList, authors });
 
 export const enqueueMetadataTranslations = (paperIds: string[]) => invoke<void>("enqueue_metadata_translations", {paperIds});
 

@@ -143,6 +143,7 @@ pub fn run() {
             commands::import_browser_download,
             commands::import_pdf_url,
             commands::parse_pdf,
+            commands::start_local_parse,
             commands::save_local_parse,
             jobs::list_jobs,
             jobs::cancel_job,

@@ -1508,6 +1508,16 @@ pub async fn parse_pdf(
     get_paper_inner(&db, &paper_id)
 }
 
+/// 排队一次本机正文提取（不需要进度通道）。
+///
+/// `parse_pdf` 带 Channel 参数只是历史遗留的进度回传方式，实际进度走任务表；
+/// 自动化脚本与「重试解析」直接调用这个命令即可。
+#[tauri::command]
+pub fn start_local_parse(db: State<'_, Db>, paper_id: String) -> Result<Paper, String> {
+    begin_local_parse(&db, &paper_id)?;
+    get_paper_inner(&db, &paper_id)
+}
+
 /// 排队一次本机正文提取：标记解析中、作废同篇论文其它未完成任务，并联入 `parse_local`。
 ///
 /// 真正的提取在 WebView 里执行（pdf.js 已在包内），完成后由前端调用
@@ -1540,8 +1550,9 @@ pub fn save_local_parse(
     paper_id: String,
     markdown: String,
     content_list: String,
+    authors: Option<String>,
 ) -> Result<Paper, String> {
-    save_local_parse_inner(&db, &paper_id, &markdown, &content_list)?;
+    save_local_parse_inner(&db, &paper_id, &markdown, &content_list, authors.as_deref())?;
     get_paper_inner(&db, &paper_id)
 }
 
@@ -1550,6 +1561,7 @@ pub(crate) fn save_local_parse_inner(
     paper_id: &str,
     markdown: &str,
     content_list: &str,
+    authors: Option<&str>,
 ) -> Result<(), String> {
     if markdown.trim().is_empty() {
         return Err(
@@ -1575,8 +1587,12 @@ pub(crate) fn save_local_parse_inner(
     std::fs::write(paper_dir.join("content_list.json"), content_list)
         .map_err(|e| format!("写入 content_list.json 失败：{e}"))?;
 
-    let (extracted_title, authors, abstract_text) = extract_metadata(markdown);
-    // 只在标题还是“文件名/未命名”时才用正文标题覆盖，避免吞掉用户改名。
+    let (extracted_title, fallback_authors, abstract_text) = extract_metadata(markdown);
+    // 前端排版阶段能从标题下方认出作者行，比后端猜得准；没认出来就沿用原值。
+    let authors = authors
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or(fallback_authors);    // 只在标题还是“文件名/未命名”时才用正文标题覆盖，避免吞掉用户改名。
     let title_is_placeholder = current_title.trim().is_empty()
         || current_title == "未命名论文"
         || current_title.to_lowercase().ends_with(".pdf");
@@ -5515,13 +5531,22 @@ mod tests {
     fn local_parse_saves_files_and_chunks_without_vectors() {
         let (db, paper, tmp) = local_parse_fixture();
         let markdown = "# Attention Is All You Need\n\nAshish Vaswani\n\n## Abstract\n\nWe propose the Transformer.\n\n## 1 Introduction\n\nRecurrent networks are slow.";
-        save_local_parse_inner(&db, &paper.id, markdown, &sample_content_list()).unwrap();
+        save_local_parse_inner(
+            &db,
+            &paper.id,
+            markdown,
+            &sample_content_list(),
+            Some("Ashish Vaswani, Noam Shazeer"),
+        )
+        .unwrap();
 
         let saved = get_paper_inner(&db, &paper.id).unwrap();
         assert_eq!(saved.parse_status, "ready");
         assert_eq!(saved.parse_engine.as_deref(), Some("local"));
         // 导入时标题来自文件名 download.pdf，被正文标题替换。
         assert_eq!(saved.title, "Attention Is All You Need");
+        // 前端认出的作者行优先于后端兜底。
+        assert_eq!(saved.authors.as_deref(), Some("Ashish Vaswani, Noam Shazeer"));
         assert!(saved
             .abstract_text
             .as_deref()
@@ -5562,7 +5587,7 @@ mod tests {
     #[test]
     fn local_parse_rejects_text_free_documents_and_keeps_status() {
         let (db, paper, tmp) = local_parse_fixture();
-        let error = save_local_parse_inner(&db, &paper.id, "   \n\n  ", "[]").unwrap_err();
+        let error = save_local_parse_inner(&db, &paper.id, "   \n\n  ", "[]", None).unwrap_err();
         assert!(error.contains("扫描件"), "错误信息应提示扫描件，实际：{error}");
         assert_eq!(
             get_paper_inner(&db, &paper.id).unwrap().parse_status,

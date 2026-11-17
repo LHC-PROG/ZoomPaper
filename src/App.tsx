@@ -71,7 +71,7 @@ function App() {
                   if (!(await reportJobProgress(job.id,"extract",done,total))) throw new Error("解析已取消");
                 },
               });
-              await saveLocalParse(job.paper_id, result.markdown, result.contentList);
+              await saveLocalParse(job.paper_id, result.markdown, result.contentList, result.authors);
             }catch(e){error=String(e);}
             finally{parsingLocal.current=false;}
             await finishFrontendJob(job.id,error).catch(()=>{});
