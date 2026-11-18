@@ -289,7 +289,81 @@ describe("目录与摘要补齐", () => {
   });
 });
 
-describe("buildDocument", () => {  it("产出可直接落盘的 Markdown 与 content_list", () => {
+describe("首页抬头与标题", () => {
+  it("小型大写字母标题（同一行字号混排）不会被栏缝切成两段", () => {
+    // ICLR 的标题把大写字母与小型大写字母混排：17.2 / 13.8 交替出现。
+    const items: PdfTextItem[] = [
+      item("A", 108, 698.4, 14, 17.2),
+      item("N", 122, 698.4, 14, 13.8),
+      item(" I", 137, 698.4, 14, 17.2),
+      item("MAGE IS", 143, 698.4, 60, 13.8),
+      item(" W", 209, 698.4, 16, 17.2),
+      item("ORTH", 226, 698.4, 24, 13.8),
+      item(" 16", 271, 698.4, 18, 17.2),
+      item("X", 290, 698.4, 10, 13.8),
+      item("16 W", 300, 698.4, 40, 17.2),
+      item("ORDS:", 341, 698.4, 40, 13.8),
+      item("1 INTRODUCTION", 108, 520, 90, 12),
+      item("Body text of the introduction that is long enough to be prose.", 108, 500, 400, 10),
+    ];
+    for (let index = 0; index < 8; index++) {
+      items.push(item(`Left column body line ${index} keeps going`, 108, 480 - index * 12, 200, 10));
+      items.push(item(`Right column body line ${index} keeps going`, 330, 480 - index * 12, 200, 10));
+    }
+    const result = buildDocument([page(0, items, 612, 792)]);
+    expect(result.markdown.split("\n")[0]).toBe("# AN IMAGE IS WORTH 16X16 WORDS:");
+  });
+
+  it("标题折行到连字符时把下一行接回标题", () => {
+    const items: PdfTextItem[] = [
+      item("LORA: LOW-RANK ADAPTATION OF LARGE LAN-", 60, 760, 480, 20),
+      item("GUAGE MODELS", 200, 736, 160, 13),
+      item("Edward Hu, Yelong Shen", 60, 700, 180, 11),
+      item("ABSTRACT", 60, 670, 70, 12),
+      item("We propose low-rank adaptation of large language models, which freezes", 60, 650, 420, 10),
+      item("the pre-trained weights and injects trainable rank decomposition matrices.", 60, 638, 440, 10),
+      item("1 INTRODUCTION", 60, 610, 90, 12),
+      item("Fine-tuning large models is expensive because every weight is updated.", 60, 590, 420, 10),
+    ];
+    const result = buildDocument([page(0, items)]);
+    expect(result.markdown.split("\n")[0]).toBe("# LORA: LOW-RANK ADAPTATION OF LARGE LANGUAGE MODELS");
+  });
+
+  it("首页脚注与标记行（∗ ∗、equal contribution、Version）不进入正文", () => {
+    const items: PdfTextItem[] = [
+      item("A Reasonable Paper Title", 60, 760, 300, 18),
+      item("Alice Smith, Bob Jones", 60, 730, 200, 11),
+      item("∗ ∗ (Version 2)", 60, 718, 100, 8),
+      item("† equal technical contribution", 60, 706, 160, 8),
+      item("Google Research {alice,bob}@google.com", 60, 694, 260, 10),
+      item("Abstract", 60, 660, 55, 13),
+      item("This paper studies a problem and reports results from several", 60, 640, 420, 10),
+      item("experiments that were run on multiple datasets for comparison.", 60, 628, 420, 10),
+      item("We also discuss the limitations of the approach and outline the", 60, 616, 420, 10),
+      item("directions we consider most promising for future work on this topic.", 60, 604, 440, 10),
+    ];
+    const result = buildDocument([page(0, items)]);
+    expect(result.markdown).not.toContain("Version 2");
+    expect(result.markdown).not.toContain("equal technical contribution");
+    expect(result.markdown).not.toContain("google.com");
+    expect(result.markdown).toContain("## Abstract");
+    expect(result.markdown).toContain("This paper studies a problem");
+  });
+
+  it("页内相邻两栏不会被当成同一行的两段", () => {
+    // 两栏正文之间隔着栏缝：即使同一基线也不能拼成一段。
+    const items: PdfTextItem[] = [item("Two Column Paper", 60, 760, 220, 18)];
+    for (let index = 0; index < 10; index++) {
+      items.push(item(`Left column sentence ${index} continues here`, 60, 700 - index * 12, 230, 10));
+      items.push(item(`Right column sentence ${index} continues here`, 320, 700 - index * 12, 230, 10));
+    }
+    const lines = buildLines(page(0, items, 612, 792)).map((line) => line.text);
+    expect(lines.some((text) => text.includes("Left column sentence 0 continues here Right column"))).toBe(false);
+  });
+});
+
+describe("buildDocument", () => {
+  it("产出可直接落盘的 Markdown 与 content_list", () => {
     const result = buildDocument([singleColumnPage()], { fallbackTitle: "fallback" });
     expect(result.markdown.startsWith("# Attention Is All You Need")).toBe(true);
     expect(result.markdown).toContain("Ashish Vaswani");

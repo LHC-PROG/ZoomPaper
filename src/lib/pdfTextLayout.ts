@@ -110,6 +110,7 @@ const BOILERPLATE: RegExp[] = [
   // arXiv 版常见：标题上方的授权声明（Attention 等论文）
   /^(provided proper attribution|reproduce the tables and figures|hereby grants permission)/i,
   /\b(solely for use in journalistic or scholarly works|permission to reproduce the tables and figures)\b/i,
+  /^(scholarly|journalistic) works?\.?$/i,
   // 目录条目：`2.1 Model and Architectures . . . . . . 3`
   /(\s\.){3,}\s*\d*\s*$/,
 ];
@@ -118,6 +119,8 @@ const BOILERPLATE: RegExp[] = [
 export function isBoilerplate(text: string): boolean {
   const value = text.trim();
   if (!value) return true;
+  // 没有字母的行（页码、公式编号、百分比、脚注符号）不承载语义。
+  if (!/[A-Za-z\u00c0-\u024f\u3400-\u9fff]/.test(value)) return true;
   return BOILERPLATE.some((pattern) => pattern.test(value));
 }
 
@@ -245,117 +248,105 @@ function pageBodySize(items: PdfTextItem[]): number {
 /**
  * 逐页把文本项排成行，并给出阅读顺序。
  *
- * 列归属只看文本项起点（在栏缝左侧即左栏），宽度只用来合并同一行内的文字——
- * 这样 PDF 里带行尾空白的 width 不会把左右栏粘在一起。
- * 通栏大标题会被拆成左右两段，这里再按「同一基线 + 同一字号 + 明显大于正文」合并回去。
+ * 三步走：
+ * 1. 只用正文文本项估栏缝——标题字号大、ICLR 还会逐字混排大小写，参与聚类会把中缝拉偏；
+ * 2. 标题行（与页面最大字号同基线，或本身接近最大字号）单独抽出来按基线合并，
+ *    小型大写字母的字号跳变不影响合并；
+ * 3. 其余内容按「居中 → 左栏 → 右栏」排序；首页顶部再整体按 y 排序并合并通栏行。
  */
 export function buildLines(page: PdfPageText): TextLine[] {
   const items = page.items.filter((item) => item.str.trim().length > 0 && !item.rotated);
   if (!items.length) return [];
   const byPosition = (a: TextLine, b: TextLine) => b.y - a.y || a.x0 - b.x0;
-  const { gutter } = detectColumnLayout(items, page.width);
+  const bodySize = pageBodySize(items);
+
+  const bodyItems = items.filter((item) => itemSize(item) < bodySize * 1.4);
+  const { gutter } = detectColumnLayout(bodyItems.length >= 12 ? bodyItems : items, page.width);
   if (gutter == null) return linesFromItems(items, page.pageIdx).sort(byPosition);
 
-  const bodySize = pageBodySize(items);
   const left = linesFromItems(items.filter((item) => item.x < gutter), page.pageIdx).sort(byPosition);
   const right = linesFromItems(items.filter((item) => item.x >= gutter), page.pageIdx).sort(byPosition);
+  const allLines = [...left, ...right];
 
-  // 居中的短行（例如通栏摘要上方的 “ABSTRACT”）起点可能落在栏缝右侧，按栏目归属会被
-  // 排到右栏去。只把「窄且居中」的行当作通栏，宽标题的左右两半仍走字号合并。
-  const centered = (line: TextLine) =>
-    Math.abs((line.x0 + line.x1) / 2 - page.width / 2) <= page.width * 0.08 &&
-    line.textWidth < page.width * 0.45;
-  const centeredLeft = left.filter(centered);
-  const centeredRight = right.filter(centered);
-  const leftColumn = left.filter((line) => !centered(line));
-  const rightColumn = right.filter((line) => !centered(line));
+  // 标题判定同时看「页面最大字号」与基线：小型大写字母的标题里正文尺寸的字母与标题同一行，
+  // 而作者行、Abstract 小标题虽然比正文大一点，却在别的基线上。
+  const pageMaxSize = Math.max(0, ...items.map((item) => itemSize(item)));
+  const titleBaselines = allLines
+    .filter((line) => line.size >= pageMaxSize * 0.9)
+    .map((line) => line.y);
+  const isTitle = (line: TextLine) =>
+    line.size >= pageMaxSize * 0.9 ||
+    (line.size >= bodySize * 1.15 && titleBaselines.some((y) => Math.abs(y - line.y) <= 1.5));
 
-  // 居中的通栏内容（大标题、居中排的 ABSTRACT）先输出；再合并被栏缝切开的大标题。
-  const spanning: TextLine[] = [...centeredLeft, ...centeredRight].sort(byPosition);
-  const usedRight = new Set<number>();
-  const remainingLeft: TextLine[] = [];
-  for (const leftLine of leftColumn) {
-    const partnerIndex = rightColumn.findIndex(
-      (rightLine, index) =>
-        !usedRight.has(index) &&
-        Math.abs(rightLine.y - leftLine.y) <= 1.5 &&
-        // 字号容差要宽一些：ICLR 标题用小型大写字母，同一行里字号会混排（17.2 / 13.8）；
-        // 但两侧都必须明显大于正文，否则会把「章节标题 + 右栏正文」误并成一行。
-        Math.abs(rightLine.size - leftLine.size) <= Math.max(1, leftLine.size * 0.25) &&
-        Math.min(leftLine.size, rightLine.size) >= bodySize * 1.15,
-    );
-    if (partnerIndex >= 0) {
-      const partner = rightColumn[partnerIndex];
-      usedRight.add(partnerIndex);
-      spanning.push({
-        ...leftLine,
-        text: `${leftLine.text} ${partner.text}`.trim(),
-        x1: partner.x1,
-        textWidth: partner.x1 - leftLine.x0,
-      });
-    } else remainingLeft.push(leftLine);
-  }
-  const remainingRight = rightColumn.filter((_, index) => !usedRight.has(index));
-
-  // 同一基线上被栏缝切开的多个通栏片段（标题、居中摘要行）合并回一行。
-  const spanningMerged: TextLine[] = [];
-  for (const line of spanning.sort(byPosition)) {
-    const last = spanningMerged[spanningMerged.length - 1];
-    if (last && Math.abs(last.y - line.y) <= 1.5 && Math.max(last.size, line.size) >= bodySize * 1.15) {
+  const titleLines: TextLine[] = [];
+  for (const line of allLines.filter(isTitle).sort(byPosition)) {
+    const last = titleLines[titleLines.length - 1];
+    const compatible =
+      last &&
+      Math.abs(last.y - line.y) <= 1.5 &&
+      Math.abs(last.size - line.size) <= Math.max(1, Math.max(last.size, line.size) * 0.3);
+    if (compatible) {
       const x0 = Math.min(last.x0, line.x0);
       const x1 = Math.max(last.x1, line.x1);
-      spanningMerged[spanningMerged.length - 1] = {
+      // 小型大写字母会把一个单词拆成多段（`16 W` + `ORDS:`），间隙极小时不能补空格。
+      const needSpace = line.x0 - last.x1 > Math.max(0.5, line.size * 0.12);
+      titleLines[titleLines.length - 1] = {
         ...last,
-        text: `${last.text} ${line.text}`.trim(),
+        text: needSpace ? `${last.text} ${line.text}`.trim() : `${last.text}${line.text}`,
         x0,
         x1,
         textWidth: x1 - x0,
       };
-    } else spanningMerged.push(line);
+    } else titleLines.push(line);
   }
 
-  // 首页顶部（第一个带编号章节之前）常见通栏摘要：左右两段其实属于同一行，
-  // 判断依据是右段紧接左段文字结尾（栏内正文的两栏之间会空出一个栏缝）。
-  let frontMatter: TextLine[] = [];
+  // 居中的短行（例如通栏摘要上方的 “ABSTRACT”）起点可能落在栏缝右侧，按栏目归属会被
+  // 排到右栏去；只把「窄且居中」的行当作通栏。
+  const centered = (line: TextLine) =>
+    Math.abs((line.x0 + line.x1) / 2 - page.width / 2) <= page.width * 0.08 &&
+    line.textWidth < page.width * 0.45;
+  const rest = allLines.filter((line) => !isTitle(line));
+  const spanning = rest.filter(centered).sort(byPosition);
+  const columnLeft = rest.filter((line) => !centered(line) && line.x0 < gutter);
+  const columnRight = rest.filter((line) => !centered(line) && line.x0 >= gutter);
+
   if (page.pageIdx === 0) {
-    const firstSection = [...remainingLeft, ...remainingRight]
+    // 首页顶部（标题、作者、单位、通栏摘要）常是通栏排版：这一段整体按 y 排序，
+    // 同一基线的左右两段合并成一行。分栏从第一个带编号章节才开始；
+    // 找不到章节标题（例如只有一页的片段）时退回按栏排序，避免两栏正文交错拼接。
+    const firstSection = rest
       .filter((line) => /^(\d+\.?\s+[A-Z]|[IVX]+\.\s+[A-Z])/.test(line.text.trim()))
       .sort((a, b) => b.y - a.y)[0];
     const boundary = firstSection ? firstSection.y : Number.NEGATIVE_INFINITY;
-    const maxGap = Math.max(6, page.width * 0.012);
-    const usedFront = new Set<number>();
-    const keptLeft: TextLine[] = [];
-    for (const leftLine of remainingLeft) {
-      if (leftLine.y <= boundary) {
-        keptLeft.push(leftLine);
-        continue;
+    if (Number.isFinite(boundary)) {
+      const maxGap = Math.max(5, page.width * 0.009);
+      const top: TextLine[] = [];
+      for (const line of rest.filter((item) => item.y > boundary).sort(byPosition)) {
+        const last = top[top.length - 1];
+        // 只有「右段紧接左段」才算同一行（通栏摘要）；两栏正文之间隔着栏缝，不能拼。
+        const sameRow = last && Math.abs(last.y - line.y) <= 1.5 && line.x0 - last.x1 <= maxGap;
+        if (sameRow) {
+          const x1 = Math.max(last.x1, line.x1);
+          const needSpace = line.x0 - last.x1 > Math.max(0.5, line.size * 0.12);
+          top[top.length - 1] = {
+            ...last,
+            text: needSpace ? `${last.text} ${line.text}`.trim() : `${last.text}${line.text}`,
+            x1,
+            textWidth: x1 - last.x0,
+          };
+        } else top.push(line);
       }
-      const index = remainingRight.findIndex(
-        (rightLine, position) =>
-          !usedFront.has(position) &&
-          !usedRight.has(position) &&
-          Math.abs(rightLine.y - leftLine.y) <= 1.5 &&
-          rightLine.x0 - (leftLine.x0 + leftLine.textWidth) <= maxGap,
-      );
-      if (index >= 0) {
-        usedFront.add(index);
-        frontMatter.push({
-          ...leftLine,
-          text: `${leftLine.text} ${remainingRight[index].text}`.trim(),
-          x1: remainingRight[index].x1,
-          textWidth: remainingRight[index].x1 - leftLine.x0,
-        });
-      } else keptLeft.push(leftLine);
+      return [
+        ...titleLines,
+        ...top,
+        ...spanning.filter((line) => line.y <= boundary),
+        ...columnLeft.filter((line) => line.y <= boundary),
+        ...columnRight.filter((line) => line.y <= boundary),
+      ];
     }
-    return [
-      ...spanningMerged,
-      // 通栏摘要与未合并的首页行要一起按 y 排序，否则摘要的最后一行会跑到最前面。
-      ...[...frontMatter, ...keptLeft].sort(byPosition),
-      ...remainingRight.filter((_, position) => !usedFront.has(position)),
-    ];
   }
 
-  return [...spanningMerged, ...remainingLeft, ...remainingRight];
+  return [...titleLines, ...spanning, ...columnLeft, ...columnRight];
 }
 
 /** 正文基准字号：取出现行数最多的字号（同票取更小者）。
@@ -496,13 +487,19 @@ function pickTitleLines(pageLines: TextLine[], bodySize: number): TextLine[] {
   if (bodySize > 0 && largest < bodySize * 1.15) return [];
   const picked: TextLine[] = [];
   for (const line of head) {
-    // 字号不够的行直接跳过：arXiv 会把授权声明排在标题上方，它不是标题。
+    const previous = picked[picked.length - 1];
+    // 标题折行且上一行以连字符结尾时（`LORA: … LARGE LAN-` + `GUAGE MODELS`），
+    // 下一行的字号可能略小，但它仍是标题的一部分。
+    const hyphenContinuation =
+      previous && /[A-Za-z]-$/.test(previous.text) && previous.y - line.y <= largest * 2.2 && line.size >= bodySize;
     if (line.size < largest * 0.95) {
-      if (picked.length) break;
-      continue;
+      // 字号不够的行直接跳过：arXiv 会把授权声明排在标题上方，它不是标题。
+      if (!hyphenContinuation) {
+        if (picked.length) break;
+        continue;
+      }
     }
-    if (picked.length) {
-      const previous = picked[picked.length - 1];
+    if (previous) {
       const lineGap = previous.y - line.y;
       if (lineGap <= 0 || lineGap > largest * 2.2) break;
     }
@@ -516,8 +513,8 @@ function pickTitleLines(pageLines: TextLine[], bodySize: number): TextLine[] {
 const lineKey = (line: TextLine) => `${line.pageIdx}:${line.y}:${line.text}`;
 
 /**
- * 首页抬头里的单位、邮箱、作者单位行：属于元数据，不该混进正文段落。
- * 只扫首页前 10 行，避免误伤正文里提到机构名的句子。
+ * 首页抬头里的单位、邮箱、作者网格、脚注与标记行：属于元数据，不该混进正文段落。
+ * 只扫首页前 24 行（作者网格可能有好几行），并避开章节标题行。
  */
 function frontMatterKeys(pageLines: TextLine[], titleKeys: Set<string>, authors: string): Set<string> {
   const keys = new Set<string>();
@@ -526,7 +523,10 @@ function frontMatterKeys(pageLines: TextLine[], titleKeys: Set<string>, authors:
     .split(/[,，]\s*/)
     .map((name) => name.trim())
     .filter((name) => name.length >= 4);
-  for (const line of pageLines.slice(0, 10)) {
+  // 首页抬头里的脚注与标记行：`∗ ∗ (Version 2)`、`† equal technical contribution`。
+  const MARKER = /^[\u2217\u2020\u2021\u00a7\u00b6*†‡§¶]/;
+  const FOOTNOTE = /^(equal (technical )?contribution|corresponding author|work done (while|at)|\(?version \d)/i;
+  for (const line of pageLines.slice(0, 24)) {
     const key = lineKey(line);
     if (titleKeys.has(key)) continue;
     const text = line.text.trim();
@@ -536,6 +536,25 @@ function frontMatterKeys(pageLines: TextLine[], titleKeys: Set<string>, authors:
       continue;
     }
     if (authorNames.length && authorNames.some((name) => text.includes(name))) {
+      keys.add(key);
+      continue;
+    }
+    if (MARKER.test(text) || FOOTNOTE.test(text)) {
+      keys.add(key);
+      continue;
+    }
+    // 作者网格里同一条基线上并排多个名字时，行内几乎全是首字母大写的词。
+    const words = text.split(/\s+/).filter(Boolean);
+    const nameLike = words.filter((word) => /^[A-Z\u00c0-\u024f][\w\u00c0-\u024f.'’-]*$/.test(word)).length;
+    if (
+      words.length >= 2 &&
+      nameLike >= words.length * 0.7 &&
+      text.length <= 200 &&
+      !TERMINAL.test(text) &&
+      !NUMBERED_SECTION.test(text) &&
+      !PLAIN_HEADING.test(text) &&
+      !/@|\{/.test(text)
+    ) {
       keys.add(key);
       continue;
     }
