@@ -218,10 +218,21 @@ impl Settings {
 
     /// 从 providers 列表中获取当前激活的 provider。
     pub fn active_provider(&self) -> Result<&ProviderConfig> {
+        if self.providers.is_empty() {
+            anyhow::bail!("尚未配置 AI 服务：请到「设置 → AI 模型与 API」添加一个 Provider（OpenAI、Anthropic、Gemini、DeepSeek 或兼容接口）");
+        }
+        if self.active_provider_id.trim().is_empty() {
+            anyhow::bail!("尚未选择要使用的 AI 服务：请到「设置 → AI 模型与 API」选择一个 Provider");
+        }
         self.providers
             .iter()
             .find(|p| p.id == self.active_provider_id && p.enabled)
-            .with_context(|| format!("当前激活的 provider '{}' 不存在", self.active_provider_id))
+            .with_context(|| {
+                format!(
+                    "当前使用的 AI 服务「{}」已被删除或停用：请到「设置 → AI 模型与 API」重新选择",
+                    self.active_provider_id
+                )
+            })
     }
 
     /// 迁移旧配置到新结构（api_keys → providers）。
@@ -541,6 +552,33 @@ mod tests {
         assert_eq!(value["active_provider_id"], "");
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert!(loaded.providers.is_empty());
+    }
+
+    /// 没配服务时，错误信息要告诉新用户下一步该做什么，而不是只回一个空 provider id。
+    #[test]
+    fn missing_provider_explains_how_to_configure_it() {
+        let mut settings = Settings::default();
+        let message = settings.active_provider().unwrap_err().to_string();
+        assert!(message.contains("尚未配置 AI 服务"), "{message}");
+        assert!(message.contains("设置"), "错误信息应指向设置页：{message}");
+
+        settings.providers.push(ProviderConfig {
+            id: "p1".to_string(),
+            name: "P1".to_string(),
+            provider_type: "openai-compat".to_string(),
+            api_key: "test-key".to_string(),
+            base_url: Some("https://example.invalid/v1".to_string()),
+            default_model: "test-model".to_string(),
+            models: vec![],
+            enabled: true,
+        });
+        let message = settings.active_provider().unwrap_err().to_string();
+        assert!(message.contains("尚未选择要使用的 AI 服务"), "{message}");
+
+        settings.active_provider_id = "gone".to_string();
+        let message = settings.active_provider().unwrap_err().to_string();
+        assert!(message.contains("已被删除或停用"), "{message}");
+        assert!(message.contains("gone"), "错误信息应带上失效的服务 id：{message}");
     }
 
     #[test]

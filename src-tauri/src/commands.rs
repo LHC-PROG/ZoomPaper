@@ -1662,7 +1662,7 @@ pub(crate) async fn parse_background(
     };
     let api_key = Settings::load().map_err(|e| e.to_string())?.mineru_api_key;
     if api_key.is_empty() {
-        return Err("未配置 MinerU API Key，请先在设置页填写".into());
+        return Err("已选择 MinerU 云端解析，但没有填写 API Key。请在「设置 → 导入与解析」填写 Key，或把「正文提取方式」切回「本机提取」".into());
     }
 
     // 网络调用（await 期间不持有数据库锁）
