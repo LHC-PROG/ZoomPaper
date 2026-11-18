@@ -15,11 +15,16 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { Check, Loader2, Plus, Edit2, Trash2 } from "lucide-react";
-import { getSettings, getThemesDir, listCustomThemes, listPapers, listJobs, emptyTrash, enqueueMetadataTranslations, DEFAULT_WORKFLOW, type Paper, type WorkflowSettings, reindexAllPapers, updateSettings, addProvider, updateProvider, deleteProvider, setActiveProvider, type Settings, type ProviderConfig, } from "@/lib/api";
+import { getSettings, getThemesDir, listCustomThemes, listPapers, listJobs, emptyTrash, enqueueMetadataTranslations, DEFAULT_WORKFLOW, usageSummary, resetUsage, secretStorageInfo, type UsageSummary, type Paper, type WorkflowSettings, reindexAllPapers, updateSettings, addProvider, updateProvider, deleteProvider, setActiveProvider, type Settings, type ProviderConfig, } from "@/lib/api";
 import { PROVIDER_TEMPLATES, createProviderFromTemplate, type ProviderTemplate } from "@/lib/providerTemplates";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, } from "@/components/ui/dialog";
 type SettingsSection = 'general' | 'reader' | 'companion' | 'ai' | 'import' | 'data';
 const SECTIONS = [{ id: 'general', name: '常规', icon: SettingsIcon }, { id: 'reader', name: '论文阅读', icon: BookOpen }, { id: 'companion', name: '阅读伙伴', icon: Bot }, { id: 'ai', name: 'AI 模型与 API', icon: MessageSquare }, { id: 'import', name: '导入与解析', icon: Upload }, { id: 'data', name: '数据与存储', icon: Database }] as const;
+
+/** token 数量按千分位缩写，避免大数字挤满一行。 */
+const formatTokens = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(2)}M` : value >= 1000 ? `${(value / 1000).toFixed(1)}k` : String(value);
+/** 微元 → 元：小额保留 4 位，避免显示成 0.00。 */
+const formatCost = (micro: number) => (micro / 1_000_000).toFixed(micro >= 10_000 ? 2 : 4);
 export function SettingsPage() {
     const prefs = usePreferences();
     const [customThemes, updateCustomThemes] = useState<CustomTheme[]>([]);
@@ -55,6 +60,11 @@ export function SettingsPage() {
     const [saving, setSaving] = useState(false);
     const [saved, setSaved] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [usage, setUsage] = useState<UsageSummary | null>(null);
+    const [secretBackend, setSecretBackend] = useState('');
+    useEffect(() => { void secretStorageInfo().then(setSecretBackend).catch(() => { }); }, []);
+    // 进入「AI 模型与 API」时刷新用量，避免每次渲染都查库。
+    useEffect(() => { if (section === 'ai') void loadUsage(); }, [section]);
     const [reindexing, setReindexing] = useState(false);
     const [reindexResult, setReindexResult] = useState<string | null>(null);
     const [showAddDialog, setShowAddDialog] = useState(false);
@@ -136,6 +146,41 @@ export function SettingsPage() {
         finally {
             setSaving(false);
         } });
+    }
+    function saveSettingsPatch(patch: Partial<Settings>) {
+        const next = { ...settingsRef.current!, ...patch };
+        settingsRef.current = next;
+        setSettings(next);
+        setError(null);
+        setSaving(true);
+        saveQueue.current = saveQueue.current.catch(() => { }).then(async () => { try {
+            await updateSettings(next);
+            setSaved(true);
+            setTimeout(() => setSaved(false), 2000);
+        }
+        catch (e) {
+            setError(String(e));
+        }
+        finally {
+            setSaving(false);
+        } });
+    }
+    /** 改「当前模型」的单价：命中已有规则就改它，否则按模型名新建一条。 */
+    function savePrice(model: string, patch: { input?: number; output?: number }) {
+        if (!model) return;
+        const pricing = [...(settingsRef.current?.pricing ?? [])];
+        const index = pricing.findIndex((rule) => rule.pattern && model.toLowerCase().includes(rule.pattern.toLowerCase()));
+        if (index >= 0) pricing[index] = { ...pricing[index], input_per_million: patch.input ?? pricing[index].input_per_million, output_per_million: patch.output ?? pricing[index].output_per_million };
+        else pricing.unshift({ pattern: model, input_per_million: patch.input ?? 0, output_per_million: patch.output ?? 0 });
+        saveSettingsPatch({ pricing });
+    }
+    async function loadUsage() {
+        try { setUsage(await usageSummary(30)); }
+        catch (e) { setError(String(e)); }
+    }
+    async function handleResetUsage() {
+        try { await resetUsage(); await loadUsage(); setActionStatus('用量统计已清空'); }
+        catch (e) { setError(String(e)); }
     }
     async function perform(name: string) {
         setWorking(true);
@@ -284,6 +329,8 @@ export function SettingsPage() {
         }
     }
     const workflow = { ...DEFAULT_WORKFLOW, ...current.workflow };
+    const activeModel = current.providers.find(provider => provider.id === current.active_provider_id)?.default_model ?? '';
+    const activePrice = (current.pricing ?? []).find(rule => rule.pattern && activeModel.toLowerCase().includes(rule.pattern.toLowerCase()));
     const row = (id: string, label: string, control: React.ReactNode) => <div id={`setting-${id}`} className="flex min-h-[64px] items-center justify-between gap-5 py-4"><span className="text-sm">{label}</span><div className="flex shrink-0 items-center gap-2">{control}</div></div>;
     const toggle = (key: keyof Preferences, label: string) => row(key, label, <Switch aria-label={label} checked={Boolean(prefs[key])} onCheckedChange={value => setPreferences({ [key]: value })}/>);
     const selectControl = (label: string, value: string, options: {value:string;label:string}[], change: (value:string)=>void) => <Select value={value} onValueChange={value=>{if(value!==null)change(value);}}><SelectTrigger aria-label={label} className="h-8 min-w-32 border-zp-border shadow-none"><SelectValue>{options.find(option=>option.value===value)?.label}</SelectValue></SelectTrigger><SelectContent>{options.map(option=><SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent></Select>;
@@ -294,7 +341,7 @@ export function SettingsPage() {
         { id: 'general', groups: [{ title: '外观', rows: [row('theme', '主题配色', <>{selectControl('主题配色', theme.scheme, [...THEME_PRESETS.map(p => ({value:p.key,label:p.key==='green'?'默认':p.label})), {value:'custom',label:'自定义'}], value=>setTheme(value as typeof theme.scheme))}{theme.scheme==='custom' && <input type="color" aria-label="自定义主色" value={theme.customColor} onChange={event=>setTheme('custom',event.target.value)} className="h-8 w-10 cursor-pointer rounded border border-zp-border"/>}</>)] }, { title: '高级主题', rows: [row('customTheme', 'JSON 主题', <>{selectControl('JSON 主题', customThemeName||'none', [{value:'none',label:'无'},...customThemes.map(t=>({value:t.name,label:t.name}))], value=>{const name=value==='none'?'':value;updateCustomThemeName(name);setCustomTheme(customThemes.find(t=>t.name===name)??null);})}<Button size="sm" variant="outline" onClick={()=>void getThemesDir().then(revealItemInDir).catch(error=>setError(String(error)))}>主题目录</Button><Button size="sm" variant="ghost" onClick={()=>void refreshThemes()}>刷新</Button></>)] }, { title: '标题与摘要'  , rows: [language('titleLanguage', '统一标题语言'), language('libraryLanguage', '论文库标题', true), language('tabLanguage', '论文标签标题', true), language('detailLanguage', '概览标题', true), language('abstractLanguage', '概览摘要'), language('historyLanguage', '阅读历史标题', true)] }, { title: '启动', rows: [toggle('restoreTabs', '恢复上次打开的论文')] }] },
         { id: 'reader', groups: [{ title: '阅读器', rows: [toggle('markReading', '打开后标记在读'), toggle('markReadAtEnd', '读到末页自动标记已读'), toggle('showAssistant', '默认显示 AI 助手')] }] },
         { id: 'companion', groups: [{ title: '阅读伙伴', rows: [row('pet', '显示桌面阅读伙伴', <Switch aria-label="显示桌面阅读伙伴" checked={petEnabled} onCheckedChange={setCompanionEnabled}/>), row('petAnimation', '角色动画', selectControl('角色动画',prefs.petAnimation?'rich':'normal',[{value:'rich',label:'丰富'},{value:'normal',label:'普通'}],value=>setPreferences({petAnimation:value==='rich'}))), toggle('petReading', '显示正在阅读'), toggle('petTasks', '显示任务气泡')] }] },
-        { id: 'ai', groups: [{ title: 'AI 服务', rows: [<div key="providers" className="space-y-3 py-4">{current.providers.map(provider => <ProviderCard key={provider.id} provider={provider} isActive={provider.id === current.active_provider_id} onSetActive={() => handleSetActive(provider.id)} onEdit={() => { setEditingProvider(provider); setShowEditDialog(true); }} onDelete={() => handleDeleteProvider(provider.id)}/>)}<Button size="sm" variant="outline" onClick={() => setShowAddDialog(true)}><Plus size={15}/>添加 Provider</Button></div>] }, { title: '联网搜索', rows: [row('webProvider', '搜索 Provider', selectControl('搜索 Provider',current.web_search_provider,[{value:'none',label:'关闭'},{value:'auto',label:'自动'},{value:'deepseek',label:'DeepSeek'},{value:'anthropic',label:'Anthropic'}],value=>setSettings({...current,web_search_provider:value}))), row('webModel', '搜索模型名', <Input aria-label="搜索模型名" value={current.web_search_model ?? ''} onChange={e => setSettings({ ...current, web_search_model: e.target.value || null })} className="w-56"/>)] }] },
+        { id: 'ai', groups: [{ title: 'AI 服务', rows: [<div key="providers" className="space-y-3 py-4">{current.providers.map(provider => <ProviderCard key={provider.id} provider={provider} isActive={provider.id === current.active_provider_id} onSetActive={() => handleSetActive(provider.id)} onEdit={() => { setEditingProvider(provider); setShowEditDialog(true); }} onDelete={() => handleDeleteProvider(provider.id)}/>)}<Button size="sm" variant="outline" onClick={() => setShowAddDialog(true)}><Plus size={15}/>添加 Provider</Button></div>] }, { title: '联网搜索', rows: [row('webProvider', '搜索 Provider', selectControl('搜索 Provider',current.web_search_provider,[{value:'none',label:'关闭'},{value:'auto',label:'自动'},{value:'deepseek',label:'DeepSeek'},{value:'anthropic',label:'Anthropic'}],value=>setSettings({...current,web_search_provider:value}))), row('webModel', '搜索模型名', <Input aria-label="搜索模型名" value={current.web_search_model ?? ''} onChange={e => setSettings({ ...current, web_search_model: e.target.value || null })} className="w-56"/>)] }, { title: '用量与费用', rows: [<div key="usage" className="space-y-2 py-4 text-sm"><p aria-live="polite">{usage ? `最近 ${usage.days} 天：${usage.requests} 次调用 · 输入 ${formatTokens(usage.prompt_tokens)} / 输出 ${formatTokens(usage.completion_tokens)} tokens · 约 ¥${formatCost(usage.cost_micro)}` : '正在读取用量…'}</p>{usage && usage.by_model.length > 0 && <ul className="space-y-0.5 text-xs text-zp-tertiary">{usage.by_model.slice(0, 5).map((bucket) => <li key={bucket.label}>{bucket.label} · {formatTokens(bucket.prompt_tokens + bucket.completion_tokens)} tokens · ¥{formatCost(bucket.cost_micro)}</li>)}</ul>}{usage && usage.unpriced_models.length > 0 && <p className="text-xs text-amber-600">这些模型没有匹配到单价，费用按 0 计：{usage.unpriced_models.join('、')}。可在下方补充单价。</p>}<div className="flex gap-2 pt-1"><Button size="sm" variant="outline" disabled={working} onClick={() => void loadUsage()}>刷新用量</Button><Button size="sm" variant="ghost" disabled={working} onClick={() => void handleResetUsage()}>清空统计</Button></div><p className="text-xs text-zp-quaternary">密钥存储：{secretBackend === 'dpapi' ? 'Windows DPAPI（绑定当前登录账户）' : secretBackend === 'aes-256-gcm' ? 'AES-256-GCM（主密钥在系统钥匙串或本地密钥文件）' : '读取中…'}。论文库里不含明文密钥。</p></div>, row('price', `单价 · ${activeModel || '未选择模型'}`, <><Input key={`pin-${activeModel}-${activePrice?.input_per_million}`} aria-label="输入单价" type="number" min={0} step={0.1} defaultValue={String(activePrice?.input_per_million ?? 0)} onBlur={e => savePrice(activeModel, { input: Number(e.target.value) })} className="w-20"/><span className="text-xs text-zp-tertiary">输入 /</span><Input key={`pout-${activeModel}-${activePrice?.output_per_million}`} aria-label="输出单价" type="number" min={0} step={0.1} defaultValue={String(activePrice?.output_per_million ?? 0)} onBlur={e => savePrice(activeModel, { output: Number(e.target.value) })} className="w-20"/><span className="text-xs text-zp-tertiary">输出 · 元/百万 token</span></>)] }] },
         { id: 'import', groups: [{ title: 'PDF 解析', rows: [row('parseEngine', '正文提取方式', selectControl('正文提取方式', workflow.parseEngine ?? 'local', [{value:'local',label:'本机提取（无需 Key）'},{value:'mineru',label:'MinerU 云端（需 Key）'}], value=>saveWorkflow({ parseEngine: value as WorkflowSettings['parseEngine'] }))), row('mineru', 'MinerU API Key（可选）', <Input aria-label="MinerU API Key" type="password" autoComplete="off" value={current.mineru_api_key} onBlur={() => saveWorkflow({})} onChange={e => setSettings({ ...current, mineru_api_key: e.target.value })} className="w-56"/>), workflowToggle('autoParse', '导入后自动解析'), row('parseConcurrency', '同时解析论文数', <Input aria-label="同时解析论文数" type="number" min={1} step={1} value={concurrency} onChange={e => setConcurrency(e.target.value)} onBlur={() => { const n = Number(concurrency); if (!Number.isSafeInteger(n) || n < 1 || n > 4294967295) {
                             setError('同时解析论文数必须为正整数');
                             setConcurrency(String(workflow.parseConcurrency));

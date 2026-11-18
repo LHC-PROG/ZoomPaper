@@ -296,6 +296,26 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         }
         conn.pragma_update(None, "user_version", 20)?;
     }
+    // v21：模型调用的 token 用量与费用（按次记录，单价变化不改写历史）。
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    if version < 21 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS token_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at INTEGER NOT NULL,
+                endpoint TEXT NOT NULL,
+                model TEXT NOT NULL,
+                purpose TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL,
+                completion_tokens INTEGER NOT NULL,
+                cost_micro INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_token_usage_created ON token_usage(created_at);
+            "#,
+        )?;
+        conn.pragma_update(None, "user_version", 21)?;
+    }
     Ok(())
 }
 
@@ -343,7 +363,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            20
+            21
         );
 
         // 论文数据无损
@@ -508,7 +528,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            20
+            21
         );
 
         let items: Vec<(String, Option<i64>)> = conn
@@ -551,7 +571,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
     }
 
     /// 迁移幂等：重复执行不报错。
@@ -563,7 +583,7 @@ mod tests {
         let v: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 20);
+        assert_eq!(v, 21);
     }
 
     #[test]
@@ -594,7 +614,7 @@ mod tests {
         assert_eq!(
             conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            20
+            21
         );
     }
 

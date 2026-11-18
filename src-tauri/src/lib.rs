@@ -13,9 +13,11 @@ mod publication;
 mod qa;
 mod quiz;
 mod rag;
+mod secrets;
 mod settings;
 mod storage;
 mod translate;
+mod usage;
 
 use tauri::Manager;
 
@@ -199,6 +201,9 @@ pub fn run() {
             commands::quiz_list,
             commands::quiz_get,
             commands::quiz_delete,
+            commands::usage_summary,
+            commands::reset_usage,
+            commands::secret_storage_info,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

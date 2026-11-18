@@ -46,7 +46,7 @@ pub fn build_messages(text: &str) -> Vec<ChatMessage> {
 
 /// 调用 LLM 翻译一个英文块，返回中文译文。
 pub async fn translate_text(llm: &Llm, text: &str) -> Result<String> {
-    llm.chat(&build_messages(text)).await
+    crate::usage::with_purpose("translate", llm.chat(&build_messages(text))).await
 }
 
 pub fn build_selection_messages(text: &str, context: &str) -> Vec<ChatMessage> {

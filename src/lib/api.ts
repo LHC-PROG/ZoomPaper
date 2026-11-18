@@ -36,6 +36,37 @@ export interface Settings {
   web_search_provider: string;
   /** 原生搜索用模型名；null = 用 provider 默认 */
   web_search_model: string | null;
+  /** 模型单价（元 / 百万 token），按模型名包含匹配 */
+  pricing: PriceRule[];
+}
+
+export interface PriceRule {
+  /** 模型名关键词（忽略大小写包含匹配） */
+  pattern: string;
+  input_per_million: number;
+  output_per_million: number;
+}
+
+export interface UsageBucket {
+  label: string;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  cost_micro: number;
+}
+
+export interface UsageSummary {
+  days: number;
+  requests: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  /** 微元：1 元 = 1_000_000 */
+  cost_micro: number;
+  currency: string;
+  by_day: UsageBucket[];
+  by_model: UsageBucket[];
+  /** 有 token 但没有匹配单价的模型 */
+  unpriced_models: string[];
 }
 
 export interface Paper {
@@ -723,6 +754,13 @@ export const saveLocalParse = (paperId: string, markdown: string, contentList: s
   invoke<Paper>("save_local_parse", { paperId, markdown, contentList, authors });
 
 export const enqueueMetadataTranslations = (paperIds: string[]) => invoke<void>("enqueue_metadata_translations", {paperIds});
+
+/** 最近 `days` 天的 token 用量与估算费用。 */
+export const usageSummary = (days = 30) => invoke<UsageSummary>("usage_summary", { days });
+/** 清空用量统计，返回删除的行数。 */
+export const resetUsage = () => invoke<number>("reset_usage");
+/** 密钥的加密方式（dpapi / aes-256-gcm）。 */
+export const secretStorageInfo = () => invoke<string>("secret_storage_info");
 
 export const getThemesDir = () => invoke<string>("get_themes_dir");
 export const listCustomThemes = () => invoke<CustomTheme[]>("list_custom_themes");

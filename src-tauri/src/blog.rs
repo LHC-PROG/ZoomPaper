@@ -307,9 +307,10 @@ pub fn join_blog(body: &str, analysis: &str) -> String {
 /// 生成博客：先按公众号风格 prompt 生成正文（含原图嵌入 + 兜底），
 /// 再生成六维深度剖析，拼接返回组合 Markdown。
 pub async fn generate_blog(llm: &Llm, markdown: &str, figures: &[Figure]) -> Result<String> {
-    let body = llm.chat(&build_messages(markdown, figures)).await?;
+    let body = crate::usage::with_purpose("blog", llm.chat(&build_messages(markdown, figures))).await?;
     let body = ensure_figures_embedded(&body, figures);
-    let analysis = llm.chat(&build_analysis_messages(markdown)).await?;
+    let analysis =
+        crate::usage::with_purpose("blog", llm.chat(&build_analysis_messages(markdown))).await?;
     Ok(join_blog(&body, &analysis))
 }
 

@@ -149,6 +149,25 @@ pub struct Settings {
     pub web_search_provider: String,
     /// 原生搜索用的模型名；None 用 provider 默认（deepseek-v4-flash / llm_model）
     pub web_search_model: Option<String>,
+    /// 模型单价（元 / 百万 token），按模型名包含匹配，用于估算费用
+    #[serde(default = "default_pricing")]
+    pub pricing: Vec<crate::usage::PriceRule>,
+}
+
+/// 常见服务的参考单价（元 / 百万 token）。用户可在设置里改，命中第一条即用。
+fn default_pricing() -> Vec<crate::usage::PriceRule> {
+    let rule = |pattern: &str, input: f64, output: f64| crate::usage::PriceRule {
+        pattern: pattern.to_string(),
+        input_per_million: input,
+        output_per_million: output,
+    };
+    vec![
+        rule("deepseek", 1.0, 2.0),
+        rule("gpt-4o-mini", 1.1, 4.4),
+        rule("gpt-4o", 18.0, 72.0),
+        rule("claude", 6.0, 30.0),
+        rule("gemini", 0.5, 2.0),
+    ]
 }
 
 impl Default for Settings {
@@ -165,6 +184,7 @@ impl Default for Settings {
             embedding_model: "bge-small-en-v1.5".to_string(),
             web_search_provider: "auto".to_string(),
             web_search_model: None,
+            pricing: default_pricing(),
         }
     }
 }
@@ -176,6 +196,9 @@ impl Settings {
     }
 
     /// 从磁盘加载；文件不存在时写入默认值并返回。
+    ///
+    /// 密钥不在这里明文落盘：`settings.json` 只读非敏感字段，API Key 从 `secrets.bin`
+    /// 解密后注入内存。老版本留下的明文密钥会在第一次加载时自动迁移。
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
         if !path.exists() {
@@ -192,19 +215,87 @@ impl Settings {
             s.save()?;
         }
 
+        // 老版本的明文密钥：写进加密存储，并把 JSON 重写成脱敏版本
+        if s.has_plaintext_secrets() {
+            s.save().context("迁移明文密钥到加密存储失败")?;
+        }
+
+        // 注入加密存储里的密钥；解密失败时按「未配置」继续，用户重新填写即可
+        match crate::secrets::load() {
+            Ok(items) => s.apply_secrets(&items),
+            Err(error) => eprintln!("读取加密密钥失败（将按未配置处理）：{error}"),
+        }
+
         Ok(s)
     }
 
-    /// 持久化到磁盘。
+    /// 持久化到磁盘：密钥写加密文件，settings.json 只留非敏感字段。
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let raw = serde_json::to_string_pretty(self).context("序列化 settings 失败")?;
+        let (redacted, items) = self.split_secrets();
+        crate::secrets::save(&items).context("写入加密密钥失败")?;
+        let raw = serde_json::to_string_pretty(&redacted).context("序列化 settings 失败")?;
         crate::fs::write_md(&path, &raw).context("写入 settings.json 失败")?;
         harden_settings_permissions(&path)?;
         Ok(())
+    }
+
+    /// 是否有明文密钥留在内存/文件里（老版本数据）。
+    fn has_plaintext_secrets(&self) -> bool {
+        !self.mineru_api_key.is_empty()
+            || self.providers.iter().any(|p| !p.api_key.is_empty())
+            || self
+                .api_keys
+                .as_ref()
+                .is_some_and(|keys| {
+                    !keys.mineru.is_empty()
+                        || !keys.openai.is_empty()
+                        || !keys.anthropic.is_empty()
+                        || !keys.gemini.is_empty()
+                        || !keys.deepseek.is_empty()
+                })
+    }
+
+    /// 取出内存中的密钥，返回「脱敏副本 + 待加密条目」。
+    fn split_secrets(&self) -> (Settings, std::collections::BTreeMap<String, String>) {
+        let mut copy = self.clone();
+        let mut items = std::collections::BTreeMap::new();
+        for provider in &mut copy.providers {
+            if !provider.api_key.is_empty() {
+                items.insert(
+                    format!("provider:{}", provider.id),
+                    std::mem::take(&mut provider.api_key),
+                );
+            }
+        }
+        if !copy.mineru_api_key.is_empty() {
+            items.insert("mineru".to_string(), std::mem::take(&mut copy.mineru_api_key));
+        }
+        // 兼容字段里的旧密钥同样不能明文落盘
+        if let Some(keys) = &mut copy.api_keys {
+            *keys = ApiKeys::default();
+        }
+        (copy, items)
+    }
+
+    /// 把加密存储里的密钥写回内存结构。
+    fn apply_secrets(&mut self, items: &std::collections::BTreeMap<String, String>) {
+        for provider in &mut self.providers {
+            if let Some(secret) = items.get(&format!("provider:{}", provider.id)) {
+                provider.api_key = secret.clone();
+            }
+        }
+        if let Some(secret) = items.get("mineru") {
+            self.mineru_api_key = secret.clone();
+        }
+    }
+
+    /// 加密后端名称（设置页展示）。
+    pub fn secret_backend() -> &'static str {
+        crate::secrets::backend()
     }
 
     /// 论文库目录：用户自定义路径，或默认的 `<app_data>/papers`。

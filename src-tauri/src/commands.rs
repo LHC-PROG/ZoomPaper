@@ -2230,7 +2230,7 @@ pub fn add_reading_time(db: State<'_, Db>, paper_id: String, seconds: i64) -> Re
 
 /// 某时刻之后最近的一个本地零点（用于把跨午夜的阅读时长拆到两天）。
 fn next_local_midnight(timestamp: i64) -> i64 {
-    use chrono::{Datelike, Local, TimeZone};
+    use chrono::{Local, TimeZone};
     let Some(local) = Local.timestamp_opt(timestamp, 0).earliest() else {
         return timestamp + 86_400;
     };
@@ -5708,4 +5708,29 @@ pub fn enqueue_metadata_translations(
         crate::jobs::enqueue(&db, &id, "translate")?;
     }
     Ok(())
+}
+
+// ---------- Token 用量与费用 ----------
+
+/// 最近 `days` 天的 token 用量与估算费用（默认 30 天）。
+#[tauri::command]
+pub fn usage_summary(
+    db: State<'_, Db>,
+    days: Option<i64>,
+) -> Result<crate::usage::UsageSummary, String> {
+    crate::usage::summary(&db, days.unwrap_or(30))
+}
+
+/// 清空用量统计，返回删除的行数。
+#[tauri::command]
+pub fn reset_usage(db: State<'_, Db>) -> Result<usize, String> {
+    db.conn()
+        .execute("DELETE FROM token_usage", [])
+        .map_err(|e| e.to_string())
+}
+
+/// 密钥的加密方式（设置页展示，例如 `dpapi`）。
+#[tauri::command]
+pub fn secret_storage_info() -> Result<String, String> {
+    Ok(Settings::secret_backend().to_string())
 }

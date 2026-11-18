@@ -233,6 +233,7 @@ impl Llm {
                 if !status.is_success() {
                     anyhow::bail!("LLM 返回错误 {status}: {body}");
                 }
+                record_usage(&endpoint_of(base_url), model, &body["usage"]);
                 body["choices"][0]["message"]["content"]
                     .as_str()
                     .context("LLM 响应缺少 content")
@@ -252,6 +253,7 @@ impl Llm {
                 if !status.is_success() {
                     anyhow::bail!("LLM 返回错误 {status}: {body}");
                 }
+                record_usage("api.anthropic.com", model, &body["usage"]);
                 body["content"][0]["text"]
                     .as_str()
                     .context("Anthropic 响应缺少 content")
@@ -287,6 +289,7 @@ impl LlmChat for Llm {
                 if !status.is_success() {
                     anyhow::bail!("LLM 返回错误 {status}: {body}");
                 }
+                record_usage(&endpoint_of(base_url), model, &body["usage"]);
                 parse_openai_response(&body)
             }
             Llm::Anthropic { api_key, model } => {
@@ -303,6 +306,7 @@ impl LlmChat for Llm {
                 if !status.is_success() {
                     anyhow::bail!("LLM 返回错误 {status}: {body}");
                 }
+                record_usage("api.anthropic.com", model, &body["usage"]);
                 parse_anthropic_response(&body)
             }
         }
@@ -403,18 +407,30 @@ async fn stream_openai_compat(
 ) -> Result<ChatResponse> {
     let mut body = openai_tools_request_body(base_url, model, messages, tools);
     body["stream"] = serde_json::Value::Bool(true);
-    let resp = Client::new()
-        .post(format!("{base_url}/chat/completions"))
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await
-        .context("调用 OpenAI 兼容接口失败")?;
-    let status = resp.status();
-    if !status.is_success() {
-        let b: serde_json::Value = resp.json().await.context("解析错误响应失败")?;
-        anyhow::bail!("LLM 返回错误 {status}: {b}");
+    // 让服务在最后一条 chunk 里带上 usage；个别中转站不认这个字段，失败时去掉重试一次。
+    body["stream_options"] = serde_json::json!({ "include_usage": true });
+    let send = |body: &serde_json::Value| {
+        Client::new()
+            .post(format!("{base_url}/chat/completions"))
+            .bearer_auth(api_key)
+            .json(body)
+            .send()
+    };
+    let mut resp = send(&body).await.context("调用 OpenAI 兼容接口失败")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if text.contains("stream_options") {
+            if let Some(object) = body.as_object_mut() {
+                object.remove("stream_options");
+            }
+            resp = send(&body).await.context("调用 OpenAI 兼容接口失败")?;
+        } else {
+            anyhow::bail!("LLM 返回错误 {status}: {text}");
+        }
     }
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
     let mut parser = OpenAiStreamParser::default();
     // 字节缓冲：多字节 UTF-8 字符可能被拆到相邻 chunk，若逐 chunk 做
     // from_utf8_lossy 会产生 U+FFFD（�）；改为按 `\n`（ASCII，绝不作为
@@ -429,6 +445,7 @@ async fn stream_openai_compat(
         let chunk = chunk.context("读取流失败")?;
         buf.extend_from_slice(&chunk);
         drain_lines(&mut buf, &mut |line| {
+            collect_sse_usage(&line, &mut prompt_tokens, &mut completion_tokens);
             if let Some(evt) = parser.push_line(&line) {
                 on_event(evt);
             }
@@ -437,6 +454,10 @@ async fn stream_openai_compat(
             break;
         }
     }
+    record_usage(&endpoint_of(base_url), model, &serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+    }));
     parser.finish()
 }
 
@@ -467,6 +488,8 @@ async fn stream_anthropic(
         anyhow::bail!("LLM 返回错误 {status}: {b}");
     }
     let mut parser = AnthropicStreamParser::default();
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
     // 同上：字节缓冲 + 完整行解码，避免跨 chunk 的 UTF-8 字符被 lossy 损坏
     let mut buf: Vec<u8> = Vec::new();
     let mut stream = resp.bytes_stream();
@@ -478,6 +501,7 @@ async fn stream_anthropic(
         let chunk = chunk.context("读取流失败")?;
         buf.extend_from_slice(&chunk);
         drain_lines(&mut buf, &mut |line| {
+            collect_sse_usage(&line, &mut prompt_tokens, &mut completion_tokens);
             if let Some(evt) = parser.push_line(&line) {
                 on_event(evt);
             }
@@ -486,7 +510,63 @@ async fn stream_anthropic(
             break;
         }
     }
+    record_usage(
+        "api.anthropic.com",
+        model,
+        &serde_json::json!({
+            "input_tokens": prompt_tokens,
+            "output_tokens": completion_tokens,
+        }),
+    );
     parser.finish()
+}
+
+/// 把响应的 usage 记进统计表：OpenAI 用 prompt/completion，Anthropic 用 input/output。
+fn record_usage(endpoint: &str, model: &str, usage: &serde_json::Value) {
+    let prompt = usage["prompt_tokens"]
+        .as_u64()
+        .or_else(|| usage["input_tokens"].as_u64())
+        .unwrap_or(0);
+    let completion = usage["completion_tokens"]
+        .as_u64()
+        .or_else(|| usage["output_tokens"].as_u64())
+        .unwrap_or(0);
+    crate::usage::record(
+        endpoint,
+        model,
+        crate::usage::current_purpose(),
+        prompt,
+        completion,
+    );
+}
+
+/// 服务标识：取域名，便于「按服务」汇总（中转站与官方端点自然区分）。
+fn endpoint_of(base_url: &str) -> String {
+    reqwest::Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| base_url.to_string())
+}
+
+/// 从一条 SSE 行里取 usage。OpenAI 在最后一条 chunk 给全量；
+/// Anthropic 分两次（`message_start` 给输入、`message_delta` 给累计输出），因此取较大值。
+fn collect_sse_usage(line: &str, prompt: &mut u64, completion: &mut u64) {
+    let Some(payload) = line.trim().strip_prefix("data:") else {
+        return;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(payload.trim()) else {
+        return;
+    };
+    let bump = |target: &mut u64, value: Option<u64>| {
+        if let Some(value) = value {
+            *target = (*target).max(value);
+        }
+    };
+    bump(prompt, json["usage"]["prompt_tokens"].as_u64());
+    bump(prompt, json["usage"]["input_tokens"].as_u64());
+    bump(prompt, json["message"]["usage"]["input_tokens"].as_u64());
+    bump(completion, json["usage"]["completion_tokens"].as_u64());
+    bump(completion, json["usage"]["output_tokens"].as_u64());
 }
 
 /// 解析 OpenAI 兼容响应：content（可空）+ reasoning_content/reasoning + tool_calls。

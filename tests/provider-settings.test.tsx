@@ -9,6 +9,10 @@ vi.mock('@/lib/api', () => ({
   getThemesDir: async () => '/test/themes', listPapers: async () => [], listJobs: async () => [],
   emptyTrash: vi.fn(), enqueueMetadataTranslations: vi.fn(), reindexAllPapers: vi.fn(),
   generateBlog: vi.fn(), translateChunk: vi.fn(), saveTranslation: vi.fn(),
+  // 设置页的「用量与费用」区块会读这两项
+  usageSummary: vi.fn(async () => ({ days: 30, requests: 0, prompt_tokens: 0, completion_tokens: 0, cost_micro: 0, currency: 'CNY', by_day: [], by_model: [], unpriced_models: [] })),
+  resetUsage: vi.fn(async () => 0),
+  secretStorageInfo: vi.fn(async () => 'dpapi'),
   DEFAULT_WORKFLOW: { autoParse: false, parseConcurrency: 2 },
 }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: async () => false }));
