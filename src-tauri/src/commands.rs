@@ -2228,6 +2228,38 @@ pub fn add_reading_time(db: State<'_, Db>, paper_id: String, seconds: i64) -> Re
     add_reading_time_inner(&db, &paper_id, seconds)
 }
 
+/// 某时刻之后最近的一个本地零点（用于把跨午夜的阅读时长拆到两天）。
+fn next_local_midnight(timestamp: i64) -> i64 {
+    use chrono::{Datelike, Local, TimeZone};
+    let Some(local) = Local.timestamp_opt(timestamp, 0).earliest() else {
+        return timestamp + 86_400;
+    };
+    let next_day = local.date_naive() + chrono::Duration::days(1);
+    next_day
+        .and_hms_opt(0, 0, 0)
+        .and_then(|naive| naive.and_local_timezone(Local).earliest())
+        .map(|moment| moment.timestamp())
+        .unwrap_or(timestamp + 86_400)
+}
+
+/// 把 `[start, end)` 按本地日期切开。
+///
+/// 统计按 `date(started_at)` 分天，所以一次跨午夜的会话如果整段记在开始那天，
+/// 第二天就会凭空少掉最多一小时的阅读量（深夜阅读尤其明显）。
+fn split_by_local_day(start: i64, end: i64) -> Vec<(i64, i64)> {
+    if end <= start {
+        return Vec::new();
+    }
+    let mut spans = Vec::new();
+    let mut cursor = start;
+    while cursor < end {
+        let stop = next_local_midnight(cursor).min(end);
+        spans.push((cursor, stop));
+        cursor = stop;
+    }
+    spans
+}
+
 fn add_reading_time_inner(db: &Db, paper_id: &str, seconds: i64) -> Result<(), String> {
     if seconds <= 0 {
         return Ok(());
@@ -2243,14 +2275,15 @@ fn add_reading_time_inner(db: &Db, paper_id: &str, seconds: i64) -> Result<(), S
     if n == 0 {
         return Err("论文不存在".into());
     }
-    conn.execute(
-        "INSERT INTO reading_sessions (paper_id, started_at, seconds) VALUES (?1, ?2, ?3)",
-        params![paper_id, now - seconds, seconds],
-    )
-    .map_err(|e| e.to_string())?;
+    for (start, end) in split_by_local_day(now - seconds, now) {
+        conn.execute(
+            "INSERT INTO reading_sessions (paper_id, started_at, seconds) VALUES (?1, ?2, ?3)",
+            params![paper_id, start, end - start],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
-
 /// 标记/取消「已读」：同步维护 finished_at；标记时刷新 last_read_at。返回更新后的论文。
 /// 取消已读退回 reading（而非 unread），保留「正在读」语义。
 #[tauri::command]
@@ -5309,7 +5342,26 @@ mod tests {
         assert_eq!(p1.total_read_seconds, 420);
         assert!(p1.last_read_at.is_some(), "上报时长应刷新 last_read_at");
 
-        // 按天聚合：今天 2 篇、480 秒
+        // 按天聚合：改用「今天正午」的固定时间戳写入，避免测试在午夜前后跨天失败
+        // （add_reading_time 会按上报时刻回推 start，跨午夜时本来就该拆到两天）。
+        db.conn().execute("DELETE FROM reading_sessions", []).unwrap();
+        let today_noon = |days_ago: i64| {
+            (chrono::Local::now().date_naive() - chrono::Duration::days(days_ago))
+                .and_hms_opt(12, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .earliest()
+                .unwrap()
+                .timestamp()
+        };
+        let noon = today_noon(0);
+        db.conn()
+            .execute(
+                "INSERT INTO reading_sessions (paper_id, started_at, seconds) VALUES \
+                 ('p1', ?1, 300), ('p1', ?1, 120), ('p2', ?1, 60)",
+                params![noon],
+            )
+            .unwrap();
         let stats = timeline_stats_inner(&db, 30).unwrap();
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
         let day = stats.days.iter().find(|d| d.date == today).unwrap();
@@ -5317,6 +5369,35 @@ mod tests {
         assert_eq!(day.paper_count, 2);
         assert_eq!(day.papers[0].paper_id, "p1", "当天论文按时长降序");
         assert_eq!(stats.streak, 1);
+    }
+
+    /// 深夜阅读跨过本地零点时，时长必须拆到两天，否则第二天的统计会凭空少一段。
+    #[test]
+    fn reading_time_splits_across_local_midnight() {
+        let local_midnight = |days_ago: i64| {
+            (chrono::Local::now().date_naive() - chrono::Duration::days(days_ago))
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_local_timezone(chrono::Local)
+                .earliest()
+                .unwrap()
+                .timestamp()
+        };
+        let midnight = local_midnight(0);
+        let start = midnight - 600; // 昨天 23:50
+        let end = midnight + 1200; // 今天 00:20
+        let spans = split_by_local_day(start, end);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0], (start, midnight));
+        assert_eq!(spans[1], (midnight, end));
+        assert_eq!(
+            spans.iter().map(|(from, to)| to - from).sum::<i64>(),
+            end - start,
+            "拆分不能丢时长"
+        );
+        // 同一天之内的会话不拆
+        assert_eq!(split_by_local_day(start, start + 60).len(), 1);
+        assert!(split_by_local_day(end, end).is_empty());
     }
 
     #[test]
